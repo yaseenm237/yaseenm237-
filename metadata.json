@@ -1,0 +1,6 @@
+{
+  "name": "DSP MP3 Player & Audio Equalizer",
+  "description": "Advanced Web Audio DSP MP3 player with 5-band equalizer, bass boost, real-time frequency analyzer, presets, and cyber-synthwave UI inspired by Rust Iced blueprint",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

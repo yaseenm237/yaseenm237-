@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    background-color: #090d12;
+    color: #f1f5f9;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom sleek studio range slider */
+input[type="range"].studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #22d3ee;
+  border: 2px solid #090d12;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.45);
+  cursor: pointer;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+  background: #67e8f9;
+}
+
+input[type="range"].studio-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #22d3ee;
+  border: 2px solid #090d12;
+  cursor: pointer;
+}
+
+/* Subtle custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.35);
+}
+
+@keyframes neon-ripple {
+  0% {
+    transform: translate(-50%, -50%) scale(0.18);
+    opacity: 0.78;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0;
+  }
+}
+
+.neon-ripple-ring {
+  position: fixed;
+  width: 52px;
+  height: 52px;
+  border-radius: 9999px;
+  pointer-events: none;
+  z-index: 60;
+  border: 1.5px solid rgba(34, 211, 238, 0.75);
+  background: radial-gradient(circle, rgba(34, 211, 238, 0.16) 0%, rgba(34, 211, 238, 0) 70%);
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.35);
+  animation: neon-ripple 460ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+

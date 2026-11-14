@@ -4,6 +4,8 @@ import {
   Disc3,
   Folder,
   FolderOpen,
+  FolderPlus,
+  HardDrive,
   Heart,
   Music,
   Pencil,
@@ -63,6 +65,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
   const uniqueAlbums = Array.from(new Set(playlist.map((t) => t.album)));
   const uniqueFolders = Array.from(new Set(playlist.map((t) => t.folder)));
   const favoriteCount = playlist.filter((t) => t.isFavorite).length;
+  const localCount = playlist.filter((t) => t.isImported).length;
 
   const filteredTracks = playlist.filter((t) => {
     const q = searchQuery.toLowerCase();
@@ -74,11 +77,18 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
     const matchesAlbum = filterAlbum ? t.album === filterAlbum : true;
     const matchesFolder = filterFolder ? t.folder === filterFolder : true;
     const matchesFav = libraryTab === 'favorites' ? Boolean(t.isFavorite) : true;
-    return matchesSearch && matchesArtist && matchesAlbum && matchesFolder && matchesFav;
+    const matchesLocal = libraryTab === 'local' ? Boolean(t.isImported) : true;
+    return matchesSearch && matchesArtist && matchesAlbum && matchesFolder && matchesFav && matchesLocal;
   });
+
+  const folderInputAttrs = {
+    webkitdirectory: '',
+    directory: ''
+  } as React.InputHTMLAttributes<HTMLInputElement>;
 
   const tabs: Array<{ id: LibraryTab; label: string; count: number; icon: React.ReactNode }> = [
     { id: 'tracks', label: 'All Songs', count: playlist.length, icon: <Music className="w-3.5 h-3.5" /> },
+    { id: 'local', label: 'Local', count: localCount, icon: <HardDrive className="w-3.5 h-3.5" /> },
     { id: 'albums', label: 'Albums', count: uniqueAlbums.length, icon: <Disc3 className="w-3.5 h-3.5" /> },
     { id: 'artists', label: 'Artists', count: uniqueArtists.length, icon: <User className="w-3.5 h-3.5" /> },
     { id: 'folders', label: 'Folders', count: uniqueFolders.length, icon: <FolderOpen className="w-3.5 h-3.5" /> },
@@ -91,7 +101,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
     <div className="flex flex-col h-full min-h-0 gap-3">
       {/* Search + Active Filter */}
       <div className="flex flex-wrap items-center gap-2 shrink-0">
-        <div className="relative flex-1 min-w-[180px]">
+        <div className="relative flex-1 min-w-[140px]">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
           <input
             type="text"
@@ -112,11 +122,27 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
           )}
         </div>
 
+        <label
+          title="Scan an entire local music folder for all audio files"
+          className="h-10 px-3 rounded-xl bg-[#090d12] border border-white/10 hover:border-cyan-400/50 text-xs font-medium text-slate-200 hover:text-cyan-300 flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+        >
+          <FolderPlus className="w-4 h-4 text-cyan-400" />
+          <span>Scan Folder</span>
+          <input
+            type="file"
+            multiple
+            accept="audio/*"
+            onChange={onFileUpload}
+            className="hidden"
+            {...folderInputAttrs}
+          />
+        </label>
+
         {activeFilter && (
           <button
             type="button"
             onClick={onClearFilters}
-            className="h-10 px-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-xs font-mono text-cyan-300 flex items-center gap-1.5 hover:bg-cyan-500/15 transition-colors shrink-0"
+            className="h-9 px-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-xs font-mono text-cyan-300 flex items-center gap-1.5 hover:bg-cyan-500/15 transition-colors shrink-0"
           >
             <span className="truncate max-w-[140px]">{activeFilter}</span>
             <X className="w-3.5 h-3.5" />
@@ -125,7 +151,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
       </div>
 
       {/* Category Sub-Tabs */}
-      <div className="flex items-center gap-1 border-b border-white/[0.08] pb-2.5 overflow-x-auto shrink-0">
+      <div className="flex items-center gap-1 border-b border-white/[0.08] pb-2.5 overflow-x-auto no-scrollbar shrink-0">
         {tabs.map((tab) => {
           const isActive = libraryTab === tab.id;
           return (
@@ -136,7 +162,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                 onChangeTab(tab.id);
                 onClearFilters();
               }}
-              className={`h-9 px-3 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0 ${
+              className={`h-8 sm:h-9 px-2.5 sm:px-3 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors shrink-0 ${
                 isActive
                   ? 'bg-cyan-500 text-slate-950 font-semibold'
                   : 'text-slate-400 hover:text-white hover:bg-white/5'
@@ -154,21 +180,37 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
       {/* Scrollable Content */}
       <div className="flex-1 overflow-y-auto min-h-0 pr-0.5">
-        {(libraryTab === 'tracks' || libraryTab === 'favorites') && (
+        {(libraryTab === 'tracks' || libraryTab === 'local' || libraryTab === 'favorites') && (
           <div className="divide-y divide-white/[0.06]">
             {filteredTracks.length === 0 ? (
               <div className="py-12 text-center space-y-3">
                 <p className="text-sm text-slate-400">
                   {libraryTab === 'favorites'
                     ? 'No favorite tracks yet. Tap the heart icon on any song.'
+                    : libraryTab === 'local'
+                    ? 'No local device songs loaded yet. Scan a music folder or pick audio files.'
                     : 'No matching audio files found on SD card.'}
                 </p>
-                {libraryTab === 'tracks' && (
-                  <label className="inline-flex items-center gap-2 px-4 h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-white cursor-pointer transition-colors">
-                    <Upload className="w-4 h-4 text-cyan-400" />
-                    <span>Import Audio Files</span>
-                    <input type="file" accept="audio/*" multiple onChange={onFileUpload} className="hidden" />
-                  </label>
+                {libraryTab !== 'favorites' && (
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <label className="inline-flex items-center gap-2 px-4 h-10 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-xs font-medium text-cyan-300 cursor-pointer transition-colors">
+                      <FolderPlus className="w-4 h-4" />
+                      <span>Scan Local Folder</span>
+                      <input
+                        type="file"
+                        multiple
+                        accept="audio/*"
+                        onChange={onFileUpload}
+                        className="hidden"
+                        {...folderInputAttrs}
+                      />
+                    </label>
+                    <label className="inline-flex items-center gap-2 px-4 h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-white cursor-pointer transition-colors">
+                      <Upload className="w-4 h-4 text-cyan-400" />
+                      <span>Pick Audio Files</span>
+                      <input type="file" accept="audio/*" multiple onChange={onFileUpload} className="hidden" />
+                    </label>
+                  </div>
                 )}
               </div>
             ) : (
@@ -180,7 +222,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                     key={track.id}
                     data-interactive="true"
                     onClick={() => onSelectTrack(actualIdx)}
-                    className={`py-2.5 px-2.5 rounded-xl cursor-pointer transition-colors flex items-center justify-between gap-3 ${
+                    className={`py-2.5 px-2.5 rounded-xl cursor-pointer transition-colors flex items-center justify-between gap-2.5 ${
                       isCurrent
                         ? 'bg-cyan-500/10'
                         : 'hover:bg-white/[0.04]'
@@ -202,18 +244,19 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                         </p>
                         <p className="text-xs text-slate-400 truncate">
                           {track.artist} · {track.album}
+                          {track.isImported && <span className="text-cyan-400/80"> · Local</span>}
                         </p>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-1 shrink-0">
+                    <div className="flex items-center gap-0.5 shrink-0">
                       {track.isImported && onEditTrack && (
                         <button
                           type="button"
                           onClick={(e) => onEditTrack(track, e)}
                           title="Edit track metadata"
                           aria-label={`Edit ${track.title}`}
-                          className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:text-cyan-300 hover:bg-white/5 transition-colors"
+                          className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-cyan-300 hover:bg-white/5 transition-colors"
                         >
                           <Pencil className="w-3.5 h-3.5" />
                         </button>
@@ -224,7 +267,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                           onClick={(e) => onRemoveTrack(track.id, e)}
                           title="Remove imported track"
                           aria-label={`Remove ${track.title}`}
-                          className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:text-rose-400 hover:bg-white/5 transition-colors"
+                          className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-rose-400 hover:bg-white/5 transition-colors"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -233,7 +276,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                         type="button"
                         onClick={(e) => onToggleFavorite(track.id, e)}
                         aria-label={track.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-                        className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-500 hover:text-rose-400 transition-colors"
+                        className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-rose-400 transition-colors"
                       >
                         <Heart className={`w-4 h-4 ${track.isFavorite ? 'fill-rose-500 text-rose-500' : ''}`} />
                       </button>

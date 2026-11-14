@@ -70,6 +70,15 @@ input[type="range"].studio-slider::-moz-range-thumb {
   background: rgba(34, 211, 238, 0.35);
 }
 
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 @keyframes neon-ripple {
   0% {
     transform: translate(-50%, -50%) scale(0.18);
@@ -94,3 +103,43 @@ input[type="range"].studio-slider::-moz-range-thumb {
   animation: neon-ripple 460ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
+@keyframes synthwave-gradient-drift {
+  0% {
+    background-position: 0% 25%, 100% 75%, 0% 0%;
+  }
+  50% {
+    background-position: 100% 60%, 15% 20%, 50% 50%;
+  }
+  100% {
+    background-position: 20% 90%, 85% 35%, 100% 100%;
+  }
+}
+
+.cyber-synthwave-bg {
+  background-color: #090d12;
+  background-image:
+    linear-gradient(
+      125deg,
+      rgba(9, 13, 18, 0.96) 0%,
+      rgba(15, 23, 42, 0.85) 35%,
+      rgba(6, 182, 212, 0.14) 55%,
+      rgba(15, 23, 42, 0.92) 80%,
+      rgba(9, 13, 18, 0.98) 100%
+    ),
+    linear-gradient(
+      235deg,
+      rgba(9, 13, 18, 0.95) 0%,
+      rgba(34, 211, 238, 0.09) 42%,
+      rgba(30, 41, 59, 0.65) 68%,
+      rgba(9, 13, 18, 0.98) 100%
+    ),
+    linear-gradient(180deg, #090d12 0%, #0f172a 50%, #090d12 100%);
+  background-size: 240% 240%, 220% 220%, 100% 100%;
+  animation: synthwave-gradient-drift 22s ease-in-out infinite alternate;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cyber-synthwave-bg {
+    animation: none;
+  }
+}

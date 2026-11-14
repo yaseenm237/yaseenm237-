@@ -1,4 +1,4 @@
-export type Genre = 'Synthwave' | 'Cyberpunk' | 'Electro' | 'Ambient' | 'Rock';
+export type Genre = 'Synthwave' | 'Cyberpunk' | 'Electro' | 'Ambient' | 'Rock' | 'Vocal' | 'Acoustic' | string;
 
 export interface Track {
   id: string;
@@ -10,14 +10,18 @@ export interface Track {
   url: string;
   coverAccent: string;
   genre: Genre;
+  id3Genre?: string;
+  bpm?: string;
+  year?: string;
+  hasId3Tags?: boolean;
   isFavorite?: boolean;
   isImported?: boolean;
   hasAudioData?: boolean;
 }
 
-export type VisualizerStyle = 'waterfall' | 'waterfall_3d' | 'history' | 'bars' | 'particle_blast' | 'waveform' | 'circular' | 'particles';
+export type VisualizerStyle = 'waterfall' | 'waterfall_3d' | 'history' | 'bars' | 'particle_blast' | 'waveform' | 'oscilloscope' | 'circular' | 'particles';
 
-export type LibraryTab = 'tracks' | 'albums' | 'artists' | 'folders' | 'favorites';
+export type LibraryTab = 'tracks' | 'local' | 'albums' | 'artists' | 'folders' | 'favorites';
 
 export type EqPreset = 'flat' | 'cyber' | 'rock' | 'electronic' | 'vocal' | 'acoustic';
 

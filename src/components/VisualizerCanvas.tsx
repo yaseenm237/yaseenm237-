@@ -1,10 +1,11 @@
-import React, { useEffect, useRef } from 'react';
+import React, { memo, useEffect, useRef } from 'react';
 import { VisualizerStyle } from '../types/audio';
 
 interface VisualizerCanvasProps {
   analyserRef: React.RefObject<AnalyserNode | null>;
   isPlaying: boolean;
-  styleMode: VisualizerStyle;
+  visualizerStyle?: VisualizerStyle;
+  styleMode?: VisualizerStyle;
   width?: number;
   height?: number;
   className?: string;
@@ -15,6 +16,7 @@ const HISTORY_TRAIL_DEPTH = 8;
 const BAR_COUNT = 32;
 const TERRAIN_COLS = 26;
 const TERRAIN_ROWS = 18;
+const IDLE_FRAME_INTERVAL_MS = 50; // ~20fps when paused & settled to save CPU/battery
 
 function drawSmoothCurve(
   ctx: CanvasRenderingContext2D,
@@ -41,15 +43,33 @@ function drawSmoothCurve(
   }
 }
 
-export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
+const VisualizerCanvasInner: React.FC<VisualizerCanvasProps> = ({
   analyserRef,
   isPlaying,
+  visualizerStyle,
   styleMode,
   width = 460,
   height = 180,
   className = 'w-full h-full'
 }) => {
+  const activeStyle: VisualizerStyle = visualizerStyle ?? styleMode ?? 'waterfall';
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeStyleRef = useRef<VisualizerStyle>(activeStyle);
+  const isPlayingRef = useRef<boolean>(isPlaying);
+  const analyserPropRef = useRef<React.RefObject<AnalyserNode | null>>(analyserRef);
+
+  // Sync latest props into refs without tearing down the rAF loop
+  activeStyleRef.current = activeStyle;
+  isPlayingRef.current = isPlaying;
+  analyserPropRef.current = analyserRef;
+
+  // Reusable typed arrays (zero per-frame allocations)
+  const freqBufferRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(64));
+  const timeBufferRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(128));
+  const rawBandsRef = useRef<number[]>(new Array(HISTORY_BANDS).fill(0));
+  const currentRowRef = useRef<number[]>(new Array(TERRAIN_COLS).fill(0));
+
   const waterfallHistory = useRef<number[][]>([]);
   const decayBandsRef = useRef<number[]>(new Array(HISTORY_BANDS).fill(0));
   const peakBandsRef = useRef<number[]>(new Array(HISTORY_BANDS).fill(0));
@@ -57,7 +77,7 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
   const historyTrailsRef = useRef<number[][]>([]);
   const frameCounterRef = useRef<number>(0);
 
-  // Hardware-style bar analyzer state (smoothed level + peak-hold cap + gravity velocity)
+  // Hardware-style bar analyzer state
   const barLevelsRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
   const barPeaksRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
   const barPeakHoldRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
@@ -116,11 +136,52 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
     });
   }, []);
 
+  // Single persistent requestAnimationFrame loop for the lifetime of the canvas
   useEffect(() => {
-    let animationId: number;
+    let animationId = 0;
+    let lastRenderTime = 0;
+    let hasActiveDecay = false;
 
-    const render = () => {
+    const getFreqBuffer = (size: number) => {
+      if (freqBufferRef.current.length !== size) {
+        freqBufferRef.current = new Uint8Array(size);
+      }
+      return freqBufferRef.current;
+    };
+
+    const getTimeBuffer = (size: number) => {
+      if (timeBufferRef.current.length !== size) {
+        timeBufferRef.current = new Uint8Array(size);
+      }
+      return timeBufferRef.current;
+    };
+
+    const drawIdleBaseline = (ctx: CanvasRenderingContext2D, w: number, h: number, nowMs: number) => {
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.12)';
+      ctx.fillRect(0, h / 2, w, 1);
+      const phase = nowMs / 550;
+      ctx.fillStyle = 'rgba(34, 211, 238, 0.45)';
+      for (let i = 12; i < w - 12; i += 14) {
+        const barH = Math.sin(phase + i * 0.04) * 8 + 10;
+        ctx.fillRect(i, h / 2 - barH / 2, 2.5, barH);
+      }
+    };
+
+    const render = (now: number) => {
       animationId = requestAnimationFrame(render);
+
+      if (document.hidden) return;
+
+      const playing = isPlayingRef.current;
+      const style = activeStyleRef.current;
+
+      // Throttle frame rate while paused and decayed to minimize idle CPU usage
+      if (!playing && !hasActiveDecay && now - lastRenderTime < IDLE_FRAME_INTERVAL_MS) {
+        return;
+      }
+      const dtScale = lastRenderTime > 0 ? Math.min(2.5, (now - lastRenderTime) / 16.67) : 1;
+      lastRenderTime = now;
+
       const canvas = canvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
@@ -130,17 +191,83 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
-      if (styleMode === 'history') {
-        const bufferLength = analyserRef.current ? analyserRef.current.frequencyBinCount : 64;
-        const dataArray = new Uint8Array(bufferLength);
-        const hasLiveAudio = Boolean(analyserRef.current && isPlaying);
-        if (hasLiveAudio && analyserRef.current) {
-          analyserRef.current.getByteFrequencyData(dataArray);
+      const analyser = analyserPropRef.current.current;
+      const hasLiveAudio = Boolean(analyser && playing);
+      hasActiveDecay = false;
+
+      if (style === 'oscilloscope') {
+        const bufferLength = analyser ? analyser.fftSize : 128;
+        const timeDomain = getTimeBuffer(bufferLength);
+        if (hasLiveAudio && analyser) {
+          analyser.getByteTimeDomainData(timeDomain);
+        } else {
+          timeDomain.fill(128);
         }
 
-        // Map FFT bins into smoothed normalized bands (focus on musically active range)
+        // Subtle CRT oscilloscope graticule
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.10)';
+        ctx.lineWidth = 1;
+        for (let g = 1; g <= 3; g++) {
+          const gy = (h * g) / 4;
+          ctx.beginPath();
+          ctx.moveTo(0, gy);
+          ctx.lineTo(w, gy);
+          ctx.stroke();
+        }
+        for (let v = 1; v <= 5; v++) {
+          const vx = (w * v) / 6;
+          ctx.beginPath();
+          ctx.moveTo(vx, 0);
+          ctx.lineTo(vx, h);
+          ctx.stroke();
+        }
+
+        // Rising zero-crossing trigger stabilization
+        let triggerOffset = 0;
+        if (hasLiveAudio) {
+          const searchLimit = Math.floor(bufferLength / 2);
+          for (let i = 1; i < searchLimit; i++) {
+            if (timeDomain[i - 1] < 128 && timeDomain[i] >= 128) {
+              triggerOffset = i;
+              break;
+            }
+          }
+        }
+
+        const displaySamples = Math.max(32, bufferLength - triggerOffset);
+        const sliceW = w / (displaySamples - 1);
+        const centerY = h / 2;
+        const amp = h * 0.42;
+
+        ctx.save();
+        ctx.beginPath();
+        for (let i = 0; i < displaySamples; i++) {
+          const sample = (timeDomain[triggerOffset + i] - 128) / 128;
+          const x = i * sliceW;
+          const y = hasLiveAudio
+            ? centerY + sample * amp
+            : centerY + Math.sin(now / 450 + i * 0.14) * 3;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = hasLiveAudio ? '#22d3ee' : 'rgba(34, 211, 238, 0.42)';
+        ctx.lineWidth = hasLiveAudio ? 2.2 : 1.4;
+        ctx.shadowColor = '#22d3ee';
+        ctx.shadowBlur = hasLiveAudio ? 10 : 0;
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+
+      if (style === 'history') {
+        const bufferLength = analyser ? analyser.frequencyBinCount : 64;
+        const dataArray = getFreqBuffer(bufferLength);
+        if (hasLiveAudio && analyser) {
+          analyser.getByteFrequencyData(dataArray);
+        }
+
         const maxBin = Math.min(bufferLength, 44);
-        const rawBands = new Array<number>(HISTORY_BANDS);
+        const rawBands = rawBandsRef.current;
         for (let i = 0; i < HISTORY_BANDS; i++) {
           if (!hasLiveAudio) {
             rawBands[i] = 0;
@@ -154,7 +281,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           }
         }
 
-        // Spatial 3-tap smoothing + asymmetric attack/decay envelope
         let hasResidualEnergy = false;
         for (let i = 0; i < HISTORY_BANDS; i++) {
           const left = rawBands[Math.max(0, i - 1)];
@@ -166,12 +292,11 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           const next =
             spatial > prev
               ? prev + (spatial - prev) * 0.48
-              : prev * 0.915;
+              : prev * Math.pow(0.915, dtScale);
 
           decayBandsRef.current[i] = next < 0.003 ? 0 : next;
           if (decayBandsRef.current[i] > 0.005) hasResidualEnergy = true;
 
-          // Peak hold with gravity drop
           if (decayBandsRef.current[i] >= peakBandsRef.current[i]) {
             peakBandsRef.current[i] = decayBandsRef.current[i];
             peakHoldFramesRef.current[i] = 14;
@@ -180,11 +305,12 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           } else {
             peakBandsRef.current[i] = Math.max(
               decayBandsRef.current[i],
-              peakBandsRef.current[i] - 0.011
+              peakBandsRef.current[i] - 0.011 * dtScale
             );
           }
           if (peakBandsRef.current[i] > 0.005) hasResidualEnergy = true;
         }
+        hasActiveDecay = hasResidualEnergy;
 
         frameCounterRef.current += 1;
         if (frameCounterRef.current % 2 === 0) {
@@ -194,7 +320,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           }
         }
 
-        // Subtle analyzer reference grid
         ctx.strokeStyle = 'rgba(148, 163, 184, 0.07)';
         ctx.lineWidth = 1;
         for (let g = 1; g <= 3; g++) {
@@ -214,7 +339,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
               y: baseY - v * usableH - yDrift
             }));
 
-          // 1. Render fading ghost trail curves from oldest to newest
           const trails = historyTrailsRef.current;
           for (let t = trails.length - 1; t >= 1; t--) {
             const ageRatio = 1 - t / HISTORY_TRAIL_DEPTH;
@@ -226,7 +350,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             ctx.stroke();
           }
 
-          // 2. Render subtle frequency band columns under live curve
           const colW = w / HISTORY_BANDS;
           for (let i = 0; i < HISTORY_BANDS; i++) {
             const val = decayBandsRef.current[i];
@@ -236,7 +359,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             ctx.fillRect(i * colW + 1, baseY - colH, Math.max(1, colW - 2), colH);
           }
 
-          // 3. Render main fluid spectrum curve + gradient fill
           const livePoints = toPoints(decayBandsRef.current);
           drawSmoothCurve(ctx, livePoints, baseY);
           const areaGrad = ctx.createLinearGradient(0, baseY - usableH, 0, baseY);
@@ -251,32 +373,22 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           ctx.lineWidth = 2;
           ctx.stroke();
 
-          // 4. Render peak-hold decay trace
           const peakPoints = toPoints(peakBandsRef.current);
           drawSmoothCurve(ctx, peakPoints);
           ctx.strokeStyle = 'rgba(245, 158, 11, 0.65)';
           ctx.lineWidth = 1.2;
           ctx.stroke();
         } else {
-          // Idle horizontal baseline when completely decayed
-          ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
-          ctx.fillRect(0, h / 2, w, 1);
-          const now = Date.now() / 550;
-          ctx.fillStyle = 'rgba(34, 211, 238, 0.45)';
-          for (let i = 12; i < w - 12; i += 14) {
-            const barH = Math.sin(now + i * 0.04) * 8 + 10;
-            ctx.fillRect(i, h / 2 - barH / 2, 2.5, barH);
-          }
+          drawIdleBaseline(ctx, w, h, now);
         }
         return;
       }
 
-      if (styleMode === 'bars') {
-        const bufferLength = analyserRef.current ? analyserRef.current.frequencyBinCount : 64;
-        const dataArray = new Uint8Array(bufferLength);
-        const hasLiveAudio = Boolean(analyserRef.current && isPlaying);
-        if (hasLiveAudio && analyserRef.current) {
-          analyserRef.current.getByteFrequencyData(dataArray);
+      if (style === 'bars') {
+        const bufferLength = analyser ? analyser.frequencyBinCount : 64;
+        const dataArray = getFreqBuffer(bufferLength);
+        if (hasLiveAudio && analyser) {
+          analyser.getByteFrequencyData(dataArray);
         }
 
         const usableBins = Math.min(bufferLength, 56);
@@ -285,7 +397,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         for (let i = 0; i < BAR_COUNT; i++) {
           let target = 0;
           if (hasLiveAudio) {
-            // Map across low-to-high frequencies with gentle HF transient tilt
             const normPos = i / (BAR_COUNT - 1);
             const binPos = Math.pow(normPos, 1.15) * (usableBins - 1);
             const lo = Math.floor(binPos);
@@ -296,17 +407,15 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             target = Math.min(1, raw * hfTilt);
           }
 
-          // Fast transient attack + smooth organic decay
           const prevLevel = barLevelsRef.current[i];
           const nextLevel =
             target > prevLevel
               ? prevLevel + (target - prevLevel) * 0.68
-              : prevLevel * 0.875;
+              : prevLevel * Math.pow(0.875, dtScale);
 
           barLevelsRef.current[i] = nextLevel < 0.004 ? 0 : nextLevel;
           if (barLevelsRef.current[i] > 0.005) hasResidualEnergy = true;
 
-          // Peak-hold cap with hold timer and accelerating gravity decay
           if (barLevelsRef.current[i] >= barPeaksRef.current[i]) {
             barPeaksRef.current[i] = barLevelsRef.current[i];
             barPeakHoldRef.current[i] = 18;
@@ -314,7 +423,7 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           } else if (barPeakHoldRef.current[i] > 0) {
             barPeakHoldRef.current[i] -= 1;
           } else {
-            barPeakVelRef.current[i] += 0.0014;
+            barPeakVelRef.current[i] += 0.0014 * dtScale;
             barPeaksRef.current[i] = Math.max(
               barLevelsRef.current[i],
               barPeaksRef.current[i] - barPeakVelRef.current[i]
@@ -323,8 +432,8 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
 
           if (barPeaksRef.current[i] > 0.005) hasResidualEnergy = true;
         }
+        hasActiveDecay = hasResidualEnergy;
 
-        // Subtle hardware analyzer gridlines
         ctx.strokeStyle = 'rgba(148, 163, 184, 0.07)';
         ctx.lineWidth = 1;
         for (let g = 1; g <= 3; g++) {
@@ -349,7 +458,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             const peak = barPeaksRef.current[i];
             const barH = Math.max(2, level * maxBarH);
 
-            // Gradient bar body
             const grad = ctx.createLinearGradient(0, baseY, 0, baseY - maxBarH);
             grad.addColorStop(0, 'rgba(34, 211, 238, 0.28)');
             grad.addColorStop(0.65, '#22d3ee');
@@ -360,7 +468,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             ctx.roundRect(x, baseY - barH, barW, barH, [2, 2, 0, 0]);
             ctx.fill();
 
-            // Crisp floating peak-hold cap
             if (peak > 0.015) {
               const peakY = Math.max(4, baseY - peak * maxBarH - 3);
               ctx.fillStyle = peak > 0.72 ? '#f59e0b' : '#67e8f9';
@@ -370,27 +477,18 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             }
           }
         } else {
-          ctx.fillStyle = 'rgba(148, 163, 184, 0.12)';
-          ctx.fillRect(0, h / 2, w, 1);
-          const now = Date.now() / 550;
-          ctx.fillStyle = 'rgba(34, 211, 238, 0.45)';
-          for (let i = 12; i < w - 12; i += 14) {
-            const barH = Math.sin(now + i * 0.04) * 8 + 10;
-            ctx.fillRect(i, h / 2 - barH / 2, 2.5, barH);
-          }
+          drawIdleBaseline(ctx, w, h, now);
         }
         return;
       }
 
-      if (styleMode === 'particle_blast') {
-        const bufferLength = analyserRef.current ? analyserRef.current.frequencyBinCount : 64;
-        const dataArray = new Uint8Array(bufferLength);
-        const hasLiveAudio = Boolean(analyserRef.current && isPlaying);
-        if (hasLiveAudio && analyserRef.current) {
-          analyserRef.current.getByteFrequencyData(dataArray);
+      if (style === 'particle_blast') {
+        const bufferLength = analyser ? analyser.frequencyBinCount : 64;
+        const dataArray = getFreqBuffer(bufferLength);
+        if (hasLiveAudio && analyser) {
+          analyser.getByteFrequencyData(dataArray);
         }
 
-        // Measure high-frequency band energy and transient spikes
         let hfSum = 0;
         let hfCount = 0;
         const hfStart = Math.floor(bufferLength * 0.38);
@@ -406,10 +504,11 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         blastIntensityRef.current =
           targetBlast > blastIntensityRef.current
             ? blastIntensityRef.current + (targetBlast - blastIntensityRef.current) * 0.72
-            : blastIntensityRef.current * 0.88;
+            : blastIntensityRef.current * Math.pow(0.88, dtScale);
 
         const blast = blastIntensityRef.current;
-        const speedMultiplier = hasLiveAudio ? 1 + hfEnergy * 3.2 + blast * 6.5 : 0.65;
+        if (blast > 0.02) hasActiveDecay = true;
+        const speedMultiplier = (hasLiveAudio ? 1 + hfEnergy * 3.2 + blast * 6.5 : 0.65) * dtScale;
 
         ctx.save();
         ctx.globalCompositeOperation = 'lighter';
@@ -422,7 +521,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           const prevX = p.x * w;
           const prevY = p.y * h;
 
-          // On strong HF transients, inject slight outward radial blast impulse
           if (hfTransient > 0.06) {
             const dx = p.x - 0.5;
             const dy = p.y - 0.5;
@@ -434,7 +532,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           p.x += p.vx * speedMultiplier * particleBoost;
           p.y += p.vy * speedMultiplier * particleBoost;
 
-          // Wrap smoothly around canvas edges
           if (p.x < -0.04) p.x = 1.04;
           else if (p.x > 1.04) p.x = -0.04;
           if (p.y < -0.04) p.y = 1.04;
@@ -448,7 +545,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
 
           const r = p.radius * (0.9 + p.glow * 1.15);
 
-          // Draw subtle motion streak during fast high-frequency bursts
           if (blast > 0.22 && Math.hypot(px - prevX, py - prevY) < 40) {
             ctx.strokeStyle = p.color;
             ctx.globalAlpha = Math.min(0.55, p.glow * 0.5);
@@ -459,7 +555,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             ctx.stroke();
           }
 
-          // Outer neon halo + bright core
           ctx.globalAlpha = Math.min(0.95, 0.35 + p.glow * 0.65);
           ctx.shadowColor = p.color;
           ctx.shadowBlur = 6 + p.glow * 22;
@@ -468,7 +563,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           ctx.arc(px, py, r, 0, Math.PI * 2);
           ctx.fill();
 
-          // Hot white-cyan core on bright transients
           if (p.glow > 0.55) {
             ctx.shadowBlur = 0;
             ctx.globalAlpha = (p.glow - 0.55) * 1.6;
@@ -483,15 +577,13 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         return;
       }
 
-      if (styleMode === 'waterfall_3d') {
-        const bufferLength = analyserRef.current ? analyserRef.current.frequencyBinCount : 64;
-        const dataArray = new Uint8Array(bufferLength);
-        const hasLiveAudio = Boolean(analyserRef.current && isPlaying);
-        if (hasLiveAudio && analyserRef.current) {
-          analyserRef.current.getByteFrequencyData(dataArray);
+      if (style === 'waterfall_3d') {
+        const bufferLength = analyser ? analyser.frequencyBinCount : 64;
+        const dataArray = getFreqBuffer(bufferLength);
+        if (hasLiveAudio && analyser) {
+          analyser.getByteFrequencyData(dataArray);
         }
 
-        // Beat-frequency detection on low-end bins (kick / bass pulse)
         let bassSum = 0;
         const bassBins = Math.min(6, bufferLength);
         for (let b = 0; b < bassBins; b++) {
@@ -505,12 +597,12 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         beatGlowRef.current =
           targetGlow > beatGlowRef.current
             ? beatGlowRef.current + (targetGlow - beatGlowRef.current) * 0.72
-            : beatGlowRef.current * 0.87;
+            : beatGlowRef.current * Math.pow(0.87, dtScale);
         const beatGlow = beatGlowRef.current;
+        if (beatGlow > 0.1) hasActiveDecay = true;
 
-        // Build current frequency ridge row
         const maxBin = Math.min(bufferLength, 42);
-        const currentRow = new Array<number>(TERRAIN_COLS);
+        const currentRow = currentRowRef.current;
         for (let c = 0; c < TERRAIN_COLS; c++) {
           if (!hasLiveAudio) {
             currentRow[c] = 0;
@@ -519,12 +611,10 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             const lo = Math.floor(binPos);
             const hi = Math.min(maxBin - 1, lo + 1);
             const frac = binPos - lo;
-            const val = (dataArray[lo] * (1 - frac) + dataArray[hi] * frac) / 255;
-            currentRow[c] = val;
+            currentRow[c] = (dataArray[lo] * (1 - frac) + dataArray[hi] * frac) / 255;
           }
         }
 
-        // Smooth spatial ridge
         const smoothedRow = currentRow.map((val, c) => {
           const l = currentRow[Math.max(0, c - 1)];
           const r = currentRow[Math.min(TERRAIN_COLS - 1, c + 1)];
@@ -538,13 +628,11 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             terrain3dRef.current.pop();
           }
         } else if (terrain3dRef.current.length > 0) {
-          // Smoothly blend front row for 60fps responsiveness
           terrain3dRef.current[0] = terrain3dRef.current[0].map(
             (prev, idx) => prev * 0.45 + smoothedRow[idx] * 0.55
           );
         }
 
-        // Perspective projection from 3D (x in [-1..1], z in [0..1], y elevation)
         const horizonY = h * 0.24;
         const fov = w * 0.62;
         const camDist = 1.45;
@@ -563,7 +651,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           };
         };
 
-        // Subtle beat-linked horizon glow
         const horizonGrad = ctx.createLinearGradient(0, horizonY - 18, 0, h);
         horizonGrad.addColorStop(0, `rgba(34, 211, 238, ${(0.05 + beatGlow * 0.18).toFixed(3)})`);
         horizonGrad.addColorStop(0.5, `rgba(56, 189, 248, ${(0.03 + beatGlow * 0.08).toFixed(3)})`);
@@ -573,13 +660,11 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
 
         const rows = terrain3dRef.current;
 
-        // Render back-to-front so foreground ridges cleanly occlude distant terrain
         for (let r = rows.length - 1; r >= 0; r--) {
           const depthRatio = 1 - r / (TERRAIN_ROWS - 1);
           const rowVals = rows[r];
           const pts = rowVals.map((elev, c) => project(c, r, elev));
 
-          // Filled dark terrain occlusion skirt under each ridge
           ctx.beginPath();
           ctx.moveTo(pts[0].x, h + 10);
           for (let c = 0; c < pts.length; c++) {
@@ -590,7 +675,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           ctx.fillStyle = `rgba(9, 13, 18, ${(0.72 + depthRatio * 0.22).toFixed(2)})`;
           ctx.fill();
 
-          // Longitudinal Z-grid ribs connecting to next deeper row
           if (r < rows.length - 1) {
             const nextRow = rows[r + 1];
             ctx.lineWidth = 0.9;
@@ -604,7 +688,6 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             }
           }
 
-          // Ridge wireframe contour with beat-reactive neon glow
           ctx.save();
           const rowPeak = Math.max(...rowVals);
           const isHotBeat = beatGlow > 0.45 && rowPeak > 0.42;
@@ -631,13 +714,13 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         return;
       }
 
-      if (analyserRef.current && isPlaying) {
-        const bufferLength = analyserRef.current.frequencyBinCount;
-        const dataArray = new Uint8Array(bufferLength);
-        analyserRef.current.getByteFrequencyData(dataArray);
+      if (hasLiveAudio && analyser) {
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = getFreqBuffer(bufferLength);
+        analyser.getByteFrequencyData(dataArray);
 
-        if (styleMode === 'waterfall') {
-          waterfallHistory.current.unshift(Array.from(dataArray.slice(0, 28)));
+        if (style === 'waterfall') {
+          waterfallHistory.current.unshift(Array.from(dataArray.subarray(0, 28)));
           if (waterfallHistory.current.length > 12) waterfallHistory.current.pop();
           const rows = waterfallHistory.current;
           for (let r = rows.length - 1; r >= 0; r--) {
@@ -664,12 +747,12 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
             }
             ctx.stroke();
           }
-        } else if (styleMode === 'particles') {
+        } else if (style === 'particles') {
           const beatStrength = dataArray[3] / 255;
           const cx = w / 2;
           const cy = h / 2;
           particlesRef.current.forEach((p) => {
-            p.z -= p.vz * (0.9 + beatStrength * 2.8);
+            p.z -= p.vz * (0.9 + beatStrength * 2.8) * dtScale;
             if (p.z <= 12) p.z = 290;
             const scale = 190 / p.z;
             const sx = cx + p.x * scale;
@@ -682,15 +765,15 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
               ctx.fill();
             }
           });
-        } else if (styleMode === 'waveform') {
-          const timeDomain = new Uint8Array(bufferLength);
-          analyserRef.current.getByteTimeDomainData(timeDomain);
+        } else if (style === 'waveform') {
+          const timeDomain = getTimeBuffer(analyser.fftSize);
+          analyser.getByteTimeDomainData(timeDomain);
           ctx.lineWidth = 2;
           ctx.strokeStyle = '#22d3ee';
           ctx.beginPath();
-          const sliceW = w / bufferLength;
+          const sliceW = w / timeDomain.length;
           let x = 0;
-          for (let i = 0; i < bufferLength; i++) {
+          for (let i = 0; i < timeDomain.length; i++) {
             const v = timeDomain[i] / 128.0;
             const y = (v * h) / 2;
             if (i === 0) ctx.moveTo(x, y);
@@ -699,7 +782,7 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           }
           ctx.lineTo(w, h / 2);
           ctx.stroke();
-        } else if (styleMode === 'circular') {
+        } else if (style === 'circular') {
           const cx = w / 2;
           const cy = h / 2;
           const radius = Math.min(cx, cy) * 0.5;
@@ -725,27 +808,19 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
           ctx.restore();
         }
       } else {
-        // Subtle idle baseline wave
-        ctx.fillStyle = 'rgba(148, 163, 184, 0.12)';
-        ctx.fillRect(0, h / 2, w, 1);
-        const now = Date.now() / 550;
-        ctx.fillStyle = 'rgba(34, 211, 238, 0.45)';
-        for (let i = 12; i < w - 12; i += 14) {
-          const barH = Math.sin(now + i * 0.04) * 8 + 10;
-          ctx.fillRect(i, h / 2 - barH / 2, 2.5, barH);
-        }
+        drawIdleBaseline(ctx, w, h, now);
       }
     };
 
-    render();
+    animationId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animationId);
-  }, [analyserRef, isPlaying, styleMode]);
+  }, []);
 
   return (
     <div
       className="w-full h-full flex items-center justify-center"
       style={
-        styleMode === 'waterfall_3d'
+        activeStyle === 'waterfall_3d'
           ? { perspective: '520px', transformStyle: 'preserve-3d' }
           : undefined
       }
@@ -756,7 +831,7 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
         height={height}
         className={className}
         style={
-          styleMode === 'waterfall_3d'
+          activeStyle === 'waterfall_3d'
             ? { transform: 'rotateX(10deg) scale(1.03)', transformOrigin: 'center bottom' }
             : undefined
         }
@@ -764,3 +839,5 @@ export const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({
     </div>
   );
 };
+
+export const VisualizerCanvas = memo(VisualizerCanvasInner);

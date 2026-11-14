@@ -1,6 +1,5 @@
-import React from 'react';
+import React, { memo } from 'react';
 import {
-  Disc,
   Folder,
   Heart,
   Minimize2,
@@ -14,9 +13,9 @@ import {
   VolumeX,
   ZoomIn
 } from 'lucide-react';
-import { Track, VisualizerStyle, ZoomedKnobTarget } from '../types/audio';
-import { VISUALIZER_OPTIONS, formatTime } from '../data/tracks';
-import { VisualizerCanvas } from './VisualizerCanvas';
+import { Track, ZoomedKnobTarget } from '../types/audio';
+import { formatTime } from '../data/tracks';
+import { VisualizerStage } from './VisualizerStage';
 
 interface PlayerPanelProps {
   track: Track;
@@ -31,7 +30,6 @@ interface PlayerPanelProps {
   shuffle: boolean;
   dspEnabled: boolean;
   bassBoost: boolean;
-  visualizerStyle: VisualizerStyle;
   analyserRef: React.RefObject<AnalyserNode | null>;
   showCollapseButton?: boolean;
   onTogglePlay: () => void;
@@ -43,12 +41,12 @@ interface PlayerPanelProps {
   onToggleLoop: () => void;
   onToggleShuffle: () => void;
   onToggleFavorite: (id: string) => void;
-  onChangeVisualizer: (style: VisualizerStyle) => void;
   onZoomVolume: (target: ZoomedKnobTarget) => void;
   onCollapseMini?: () => void;
+  onRelinkTrack?: (trackId: string, file: File) => void;
 }
 
-export const PlayerPanel: React.FC<PlayerPanelProps> = ({
+const PlayerPanelInner: React.FC<PlayerPanelProps> = ({
   track,
   trackIndex,
   totalTracks,
@@ -61,7 +59,6 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   shuffle,
   dspEnabled,
   bassBoost,
-  visualizerStyle,
   analyserRef,
   showCollapseButton = false,
   onTogglePlay,
@@ -73,16 +70,17 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   onToggleLoop,
   onToggleShuffle,
   onToggleFavorite,
-  onChangeVisualizer,
   onZoomVolume,
-  onCollapseMini
+  onCollapseMini,
+  onRelinkTrack
 }) => {
-  const progressPct = Math.min(100, (currentTime / (duration || 1)) * 100);
+  const progressPct = Math.min(100, Math.max(0, (currentTime / (duration || 1)) * 100));
+  const effectiveVolume = isMuted ? 0 : volume;
 
   return (
-    <div className="flex flex-col h-full justify-between gap-4">
+    <div className="flex flex-col h-full justify-between gap-2.5 sm:gap-3.5">
       {/* Top Path & Quick Playback Flags */}
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-2 min-w-0 text-xs font-mono text-slate-400">
           <Folder className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
           <span className="truncate">{track.folder}</span>
@@ -94,7 +92,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
             onClick={() => onToggleFavorite(track.id)}
             title="Toggle Favorite"
             aria-label="Toggle Favorite"
-            className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${
+            className={`w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center transition-colors ${
               track.isFavorite
                 ? 'text-rose-400 bg-rose-500/10'
                 : 'text-slate-400 hover:text-white hover:bg-white/5'
@@ -108,7 +106,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
             onClick={onToggleShuffle}
             title="Shuffle"
             aria-label="Shuffle"
-            className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${
+            className={`w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center transition-colors ${
               shuffle
                 ? 'text-cyan-400 bg-cyan-500/10'
                 : 'text-slate-400 hover:text-white hover:bg-white/5'
@@ -122,7 +120,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
             onClick={onToggleLoop}
             title="Repeat Track"
             aria-label="Repeat Track"
-            className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${
+            className={`w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center transition-colors ${
               loop
                 ? 'text-cyan-400 bg-cyan-500/10'
                 : 'text-slate-400 hover:text-white hover:bg-white/5'
@@ -137,7 +135,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
               onClick={onCollapseMini}
               title="Collapse to Mini Player"
               aria-label="Collapse to Mini Player"
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
+              className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
             >
               <Minimize2 className="w-4 h-4" />
             </button>
@@ -145,83 +143,43 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
         </div>
       </div>
 
-      {/* Visualizer Stage */}
-      <div className="relative rounded-2xl bg-[#090d12] border border-white/10 overflow-hidden flex flex-col justify-between min-h-[196px]">
-        <div className={`absolute inset-0 bg-gradient-to-br ${track.coverAccent} opacity-25 pointer-events-none`} />
-
-        {/* Live Canvas */}
-        <div className="relative h-36 w-full flex items-center justify-center">
-          <VisualizerCanvas
-            analyserRef={analyserRef}
-            isPlaying={isPlaying}
-            styleMode={visualizerStyle}
-            width={440}
-            height={144}
-            className="w-full h-full"
-          />
-
-          {/* Subtle center disc icon only when idle or circular */}
-          {(!isPlaying || visualizerStyle === 'circular') && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div
-                className={`w-12 h-12 rounded-full bg-[#090d12]/80 border border-white/15 flex items-center justify-center ${
-                  isPlaying ? 'animate-spin' : ''
-                }`}
-                style={{ animationDuration: '6s' }}
-              >
-                <Disc className="w-6 h-6 text-cyan-400" />
-              </div>
-            </div>
-          )}
-
-          {/* Clean unboxed top-corner metadata */}
-          <div className="absolute top-2.5 left-3 right-3 flex items-center justify-between text-[11px] font-mono text-slate-400 pointer-events-none">
-            <span className="tabular-nums">
-              Track {trackIndex + 1} / {totalTracks}
-            </span>
-            <span>
-              {dspEnabled ? (bassBoost ? 'DSP Active · Bass +6dB' : 'DSP Active') : 'DSP Bypassed'}
-            </span>
-          </div>
-        </div>
-
-        {/* Inline Visualizer Mode Switcher (no modal needed) */}
-        <div className="relative z-10 border-t border-white/[0.08] bg-[#0c1118]/90 px-2 py-1.5 flex items-center justify-between gap-1 overflow-x-auto">
-          {VISUALIZER_OPTIONS.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              onClick={() => onChangeVisualizer(opt.id)}
-              title={opt.desc}
-              className={`px-2 py-1 rounded-lg text-[11px] font-mono transition-colors shrink-0 ${
-                visualizerStyle === opt.id
-                  ? 'bg-cyan-500/15 text-cyan-300 font-semibold'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      {/* Isolated Visualizer Stage (updates to visualizerStyle do not re-render PlayerPanel) */}
+      <VisualizerStage
+        trackId={track.id}
+        trackIndex={trackIndex}
+        totalTracks={totalTracks}
+        coverAccent={track.coverAccent}
+        needsRelink={Boolean(track.isImported && !track.url)}
+        isPlaying={isPlaying}
+        dspEnabled={dspEnabled}
+        bassBoost={bassBoost}
+        analyserRef={analyserRef}
+        onRelinkTrack={onRelinkTrack}
+      />
 
       {/* Track Metadata */}
-      <div className="text-center space-y-1 px-1">
-        <h2 className="text-lg font-semibold text-white tracking-tight truncate">{track.title}</h2>
+      <div className="text-center space-y-0.5 px-1 shrink-0">
+        <h2 className="text-base sm:text-lg font-semibold text-white tracking-tight truncate">
+          {track.title}
+        </h2>
         <p className="text-xs text-slate-400 truncate">
           {track.artist} · {track.album} · <span className="text-slate-500">{track.genre}</span>
         </p>
       </div>
 
-      {/* Progress & Timestamps */}
-      <div className="space-y-1.5">
-        <div className="relative flex items-center">
-          <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden pointer-events-none">
+      {/* Progress & Timestamps with Tactile Scrubber Thumb */}
+      <div className="space-y-1.5 shrink-0">
+        <div className="relative h-4 flex items-center group">
+          <div className="w-full h-1.5 group-hover:h-2 bg-slate-800 rounded-full overflow-hidden pointer-events-none transition-[height]">
             <div
               className="h-full bg-cyan-400 transition-[width] duration-100"
               style={{ width: `${progressPct}%` }}
             />
           </div>
+          <div
+            className="absolute w-3.5 h-3.5 rounded-full bg-cyan-300 border-2 border-[#090d12] shadow-[0_0_8px_rgba(34,211,238,0.55)] pointer-events-none transition-transform group-hover:scale-115"
+            style={{ left: `calc(${progressPct}% - 7px)` }}
+          />
           <input
             type="range"
             min={0}
@@ -230,7 +188,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
             value={currentTime}
             onChange={(e) => onSeek(parseFloat(e.target.value))}
             aria-label="Seek track position"
-            className="studio-slider absolute inset-0 w-full h-4 -top-1.5 opacity-0 cursor-pointer"
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
           />
         </div>
         <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-400">
@@ -240,12 +198,12 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
       </div>
 
       {/* Main Transport Controls */}
-      <div className="flex items-center justify-center gap-4">
+      <div className="flex items-center justify-center gap-4 shrink-0">
         <button
           type="button"
           onClick={onPrev}
           aria-label="Previous Track"
-          className="w-11 h-11 rounded-xl bg-[#0c1118] border border-white/10 text-slate-300 hover:text-white hover:border-white/20 flex items-center justify-center transition-colors active:scale-95"
+          className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-[#0c1118] border border-white/10 text-slate-300 hover:text-white hover:border-white/25 flex items-center justify-center transition-colors active:scale-95"
         >
           <SkipBack className="w-5 h-5" />
         </button>
@@ -254,7 +212,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
           type="button"
           onClick={onTogglePlay}
           aria-label={isPlaying ? 'Pause' : 'Play'}
-          className="w-14 h-14 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center transition-colors shadow-lg shadow-cyan-500/15 active:scale-95"
+          className="w-13 h-13 sm:w-14 sm:h-14 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center transition-colors shadow-lg shadow-cyan-500/20 active:scale-95"
         >
           {isPlaying ? (
             <Pause className="w-6 h-6 fill-current" />
@@ -267,19 +225,19 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
           type="button"
           onClick={onNext}
           aria-label="Next Track"
-          className="w-11 h-11 rounded-xl bg-[#0c1118] border border-white/10 text-slate-300 hover:text-white hover:border-white/20 flex items-center justify-center transition-colors active:scale-95"
+          className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-[#0c1118] border border-white/10 text-slate-300 hover:text-white hover:border-white/25 flex items-center justify-center transition-colors active:scale-95"
         >
           <SkipForward className="w-5 h-5" />
         </button>
       </div>
 
-      {/* Master Volume Bar */}
-      <div className="flex items-center gap-3 pt-2 border-t border-white/[0.08]">
+      {/* Master Volume Bar with Unified Fill & Thumb */}
+      <div className="flex items-center gap-2.5 pt-2 border-t border-white/[0.08] shrink-0">
         <button
           type="button"
           onClick={onToggleMute}
           aria-label={isMuted ? 'Unmute' : 'Mute'}
-          className="w-9 h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 transition-colors shrink-0"
+          className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/5 transition-colors shrink-0"
         >
           {isMuted || volume === 0 ? (
             <VolumeX className="w-4 h-4 text-amber-400" />
@@ -288,18 +246,32 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
           )}
         </button>
 
-        <input
-          type="range"
-          min={0}
-          max={100}
-          value={isMuted ? 0 : volume}
-          onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-          aria-label="Master Volume"
-          className="studio-slider flex-1 h-1.5 bg-slate-800 rounded-full"
-        />
+        <div className="relative flex-1 h-4 flex items-center group">
+          <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden pointer-events-none">
+            <div
+              className={`h-full transition-[width] duration-75 ${
+                isMuted ? 'bg-amber-400/50' : 'bg-cyan-400'
+              }`}
+              style={{ width: `${effectiveVolume}%` }}
+            />
+          </div>
+          <div
+            className="absolute w-3.5 h-3.5 rounded-full bg-cyan-300 border-2 border-[#090d12] shadow-[0_0_6px_rgba(34,211,238,0.45)] pointer-events-none transition-transform group-hover:scale-115"
+            style={{ left: `calc(${effectiveVolume}% - 7px)` }}
+          />
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={effectiveVolume}
+            onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
+            aria-label="Master Volume"
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+          />
+        </div>
 
         <span className="text-xs font-mono tabular-nums text-slate-300 w-9 text-right shrink-0">
-          {Math.round(isMuted ? 0 : volume)}%
+          {Math.round(effectiveVolume)}%
         </span>
 
         <button
@@ -315,7 +287,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
             })
           }
           title="Open precision volume dial"
-          className="h-9 px-2.5 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/5 transition-colors flex items-center gap-1 text-xs font-mono shrink-0"
+          className="h-8 sm:h-9 px-2.5 rounded-lg border border-white/10 text-slate-300 hover:text-white hover:bg-white/5 transition-colors flex items-center gap-1 text-xs font-mono shrink-0"
         >
           <ZoomIn className="w-3.5 h-3.5" />
           <span>Dial</span>
@@ -324,3 +296,5 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
     </div>
   );
 };
+
+export const PlayerPanel = memo(PlayerPanelInner);

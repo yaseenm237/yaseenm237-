@@ -2,7 +2,6 @@ import { DEFAULT_TRACKS } from '../data/tracks';
 import { Track } from '../types/audio';
 
 const STORAGE_KEY = 'dsp_audio_studio_library_v1';
-const MAX_DATA_URL_BYTES = 2_500_000;
 
 interface StoredLibraryPayload {
   version: 1;
@@ -37,7 +36,7 @@ export function loadSavedLibrary(): Track[] {
               ...t,
               isImported: true,
               url: hasPersistableUrl ? t.url : '',
-              hasAudioData: hasPersistableUrl
+              hasAudioData: hasPersistableUrl || Boolean(t.hasAudioData)
             };
           })
       : [];
@@ -57,6 +56,7 @@ export function saveLibraryToStorage(playlist: Track[]): void {
     .filter((t) => defaultIds.has(t.id) && t.isFavorite)
     .map((t) => t.id);
 
+  // Store lightweight metadata in localStorage; actual audio binary blobs live in IndexedDB
   const importedTracks: Track[] = playlist
     .filter((t) => !defaultIds.has(t.id) || t.isImported)
     .map((t) => ({
@@ -69,9 +69,13 @@ export function saveLibraryToStorage(playlist: Track[]): void {
       url: t.url.startsWith('data:audio/') ? t.url : '',
       coverAccent: t.coverAccent,
       genre: t.genre,
+      id3Genre: t.id3Genre,
+      bpm: t.bpm,
+      year: t.year,
+      hasId3Tags: t.hasId3Tags,
       isFavorite: Boolean(t.isFavorite),
       isImported: true,
-      hasAudioData: t.url.startsWith('data:audio/')
+      hasAudioData: Boolean(t.hasAudioData || t.url)
     }));
 
   const payload: StoredLibraryPayload = {
@@ -83,7 +87,6 @@ export function saveLibraryToStorage(playlist: Track[]): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch (err) {
-    // Handle QuotaExceededError cleanly by stripping heavy audio payloads while keeping track metadata
     console.warn('localStorage quota reached; saving imported track metadata only.', err);
     try {
       const metadataOnly: StoredLibraryPayload = {
@@ -91,8 +94,7 @@ export function saveLibraryToStorage(playlist: Track[]): void {
         favoriteDefaultIds,
         importedTracks: importedTracks.map((t) => ({
           ...t,
-          url: '',
-          hasAudioData: false
+          url: ''
         }))
       };
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(metadataOnly));
@@ -102,10 +104,7 @@ export function saveLibraryToStorage(playlist: Track[]): void {
   }
 }
 
-export async function readImportedAudioFile(file: File): Promise<{
-  duration: number;
-  persistableUrl: string | null;
-}> {
+export async function readAudioDuration(file: File): Promise<number> {
   const objectUrl = URL.createObjectURL(file);
 
   const duration = await new Promise<number>((resolve) => {
@@ -128,18 +127,5 @@ export async function readImportedAudioFile(file: File): Promise<{
   });
 
   URL.revokeObjectURL(objectUrl);
-
-  let persistableUrl: string | null = null;
-  if (file.size <= MAX_DATA_URL_BYTES) {
-    persistableUrl = await new Promise<string | null>((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        resolve(typeof reader.result === 'string' ? reader.result : null);
-      };
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(file);
-    });
-  }
-
-  return { duration, persistableUrl };
+  return duration;
 }

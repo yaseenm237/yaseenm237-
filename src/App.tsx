@@ -16,7 +16,6 @@ import {
   MobileTab,
   PreviewMode,
   Track,
-  VisualizerStyle,
   WorkspaceTab,
   ZoomedKnobTarget
 } from './types/audio';
@@ -29,20 +28,50 @@ import { MiniPlayerBar } from './components/MiniPlayerBar';
 import { KnobZoomModal } from './components/KnobZoomModal';
 import { EditTrackModal } from './components/EditTrackModal';
 import { NeonRippleOverlay } from './components/NeonRippleOverlay';
+import { PerformanceHud } from './components/PerformanceHud';
 import { createFallbackWavUrl } from './utils/synthFallback';
-import { loadSavedLibrary, readImportedAudioFile, saveLibraryToStorage } from './utils/storage';
+import { deleteTrackBlob, loadAllTrackBlobs, saveTrackBlob } from './utils/audioDb';
+import { parseId3Tags } from './utils/id3Parser';
+import { loadSavedLibrary, readAudioDuration, saveLibraryToStorage } from './utils/storage';
 
 export default function App() {
-  // Library & Track State (hydrated from localStorage)
+  // Library & Track State (hydrated from localStorage + IndexedDB blobs)
   const [playlist, setPlaylist] = useState<Track[]>(() => loadSavedLibrary());
   const [currentIndex, setCurrentIndex] = useState(0);
   const [fallbackUrls, setFallbackUrls] = useState<Record<string, string>>({});
   const currentTrack = playlist[currentIndex] || DEFAULT_TRACKS[0];
-  const resolvedAudioUrl =
-    fallbackUrls[currentTrack.id] ||
-    currentTrack.url ||
-    createFallbackWavUrl(currentTrack.id, currentTrack.genre, currentTrack.duration);
-  const pendingPlayRef = useRef(false);
+
+  // Never override imported/local songs with synthesized fallback audio
+  const resolvedAudioUrl = currentTrack.isImported
+    ? currentTrack.url || ''
+    : fallbackUrls[currentTrack.id] ||
+      currentTrack.url ||
+      createFallbackWavUrl(currentTrack.id, currentTrack.genre, currentTrack.duration);
+
+  const shouldPlayOnLoadRef = useRef(false);
+  const loadedSrcRef = useRef('');
+
+  // Hydrate binary audio blobs from IndexedDB for imported local tracks on mount
+  useEffect(() => {
+    let cancelled = false;
+    loadAllTrackBlobs().then((blobUrls) => {
+      if (cancelled || Object.keys(blobUrls).length === 0) return;
+      setPlaylist((prev) =>
+        prev.map((track) => {
+          const restoredUrl = blobUrls[track.id];
+          if (!restoredUrl) return track;
+          return {
+            ...track,
+            url: restoredUrl,
+            hasAudioData: true
+          };
+        })
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Persist playlist & track metadata to localStorage
   useEffect(() => {
@@ -74,8 +103,7 @@ export default function App() {
   const [filterAlbum, setFilterAlbum] = useState<string | null>(null);
   const [filterFolder, setFilterFolder] = useState<string | null>(null);
 
-  // Visualizer & DSP Equalizer State
-  const [visualizerStyle, setVisualizerStyle] = useState<VisualizerStyle>('waterfall');
+  // DSP Equalizer State
   const [dspEnabled, setDspEnabled] = useState(true);
   const [bassBoost, setBassBoost] = useState(true);
   const [band60Hz, setBand60Hz] = useState(4.5);
@@ -84,7 +112,8 @@ export default function App() {
   const [band4kHz, setBand4kHz] = useState(3.0);
   const [band16kHz, setBand16kHz] = useState(5.0);
   const [eqControlStyle, setEqControlStyle] = useState<EqControlStyle>('knobs');
-  const [smartAiEnabled, setSmartAiEnabled] = useState(false);
+  const [smartAiEnabled, setSmartAiEnabled] = useState(true);
+  const [isProfilingAi, setIsProfilingAi] = useState(false);
   const [aiStatus, setAiStatus] = useState<string | null>(null);
   const [sampleRate, setSampleRate] = useState<'48kHz' | '96kHz'>('48kHz');
   const [zoomedKnob, setZoomedKnob] = useState<ZoomedKnobTarget | null>(null);
@@ -104,6 +133,8 @@ export default function App() {
   const filter16kRef = useRef<BiquadFilterNode | null>(null);
   const bassBoostRef = useRef<BiquadFilterNode | null>(null);
   const aiTimerRef = useRef<number | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
+  const aiRequestSeqRef = useRef(0);
 
   useEffect(() => {
     const onResize = () => setIsNarrowScreen(window.innerWidth < 900);
@@ -240,85 +271,186 @@ export default function App() {
     setBassBoost(false);
   };
 
-  const triggerAiProfiling = (track: Track) => {
-    if (aiTimerRef.current) window.clearTimeout(aiTimerRef.current);
-
-    let targetPreset: EqPreset = 'rock';
-    if (track.genre === 'Synthwave' || track.genre === 'Cyberpunk') targetPreset = 'cyber';
-    else if (track.genre === 'Electro') targetPreset = 'electronic';
-    else if (track.genre === 'Ambient') targetPreset = 'acoustic';
-
-    applyPreset(targetPreset);
-    setAiStatus(`Auto Genre EQ matched ${track.genre} -> ${EQ_PRESETS[targetPreset].label}`);
-    aiTimerRef.current = window.setTimeout(() => setAiStatus(null), 2800);
+  const localPresetFallback = (track: Track): EqPreset => {
+    const hay = `${track.id3Genre || ''} ${track.genre || ''} ${track.title} ${track.artist} ${track.album}`.toLowerCase();
+    if (/(synthwave|cyberpunk|retrowave|outrun|darkwave|vaporwave|synthpop|cyber)/.test(hay)) return 'cyber';
+    if (/(electro|electronic|edm|techno|house|trance|dubstep|drum & bass|glitch|bass)/.test(hay)) return 'electronic';
+    if (/(rock|metal|punk|grunge|alternative|indie|guitar)/.test(hay)) return 'rock';
+    if (/(vocal|pop|r&b|rap|hip-hop|soul|speech|podcast|ballad)/.test(hay)) return 'vocal';
+    if (/(acoustic|ambient|jazz|classical|folk|chill|lo-fi|instrumental)/.test(hay)) return 'acoustic';
+    return 'flat';
   };
 
-  // Sync audio source when track or fallback URL changes
+  const triggerAiProfiling = async (track: Track) => {
+    if (aiTimerRef.current) window.clearTimeout(aiTimerRef.current);
+    if (aiAbortRef.current) aiAbortRef.current.abort();
+
+    const seq = ++aiRequestSeqRef.current;
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+
+    setIsProfilingAi(true);
+    setAiStatus(`Profiling ID3 tags for "${track.title}"...`);
+
+    try {
+      const res = await fetch('/api/smart-genre-profiler', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          genre: track.genre,
+          id3Genre: track.id3Genre,
+          bpm: track.bpm,
+          year: track.year,
+          folder: track.folder
+        })
+      });
+
+      if (!res.ok) throw new Error(`Profiler HTTP ${res.status}`);
+      const data = (await res.json()) as {
+        detectedGenre?: string;
+        preset?: EqPreset;
+        reason?: string;
+        source?: string;
+      };
+
+      if (seq !== aiRequestSeqRef.current) return;
+
+      const chosenPreset: EqPreset =
+        data.preset && data.preset in EQ_PRESETS ? data.preset : localPresetFallback(track);
+      applyPreset(chosenPreset);
+
+      const detected = data.detectedGenre || track.id3Genre || track.genre;
+      if (data.detectedGenre && track.isImported && !track.id3Genre) {
+        setPlaylist((prev) =>
+          prev.map((t) => (t.id === track.id ? { ...t, genre: data.detectedGenre || t.genre } : t))
+        );
+      }
+
+      const modeTag = data.source === 'gemini-ai' ? 'AI Profiler' : 'ID3 Profiler';
+      setAiStatus(
+        `${modeTag}: ${detected} -> ${EQ_PRESETS[chosenPreset].label}${data.reason ? ` · ${data.reason}` : ''}`
+      );
+      aiTimerRef.current = window.setTimeout(() => setAiStatus(null), 5000);
+    } catch (err) {
+      if ((err as Error).name === 'AbortError' || seq !== aiRequestSeqRef.current) return;
+      const fallbackPreset = localPresetFallback(track);
+      applyPreset(fallbackPreset);
+      setAiStatus(
+        `ID3 Profiler: ${track.id3Genre || track.genre} -> ${EQ_PRESETS[fallbackPreset].label}`
+      );
+      aiTimerRef.current = window.setTimeout(() => setAiStatus(null), 3500);
+    } finally {
+      if (seq === aiRequestSeqRef.current) {
+        setIsProfilingAi(false);
+      }
+    }
+  };
+
+  // Sync audio element source only when track or resolved URL actually changes
   useEffect(() => {
     const audio = audioRef.current;
     if (audio) {
-      audio.pause();
-      audio.currentTime = 0;
-      setCurrentTime(0);
-      setDuration(currentTrack.duration);
-      audio.load();
-      if (isPlaying || pendingPlayRef.current) {
-        pendingPlayRef.current = true;
+      if (!resolvedAudioUrl) {
+        loadedSrcRef.current = '';
+        shouldPlayOnLoadRef.current = false;
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+        setCurrentTime(0);
+        setDuration(currentTrack.duration);
+        setIsPlaying(false);
+      } else if (loadedSrcRef.current !== resolvedAudioUrl) {
+        loadedSrcRef.current = resolvedAudioUrl;
+        audio.pause();
+        audio.src = resolvedAudioUrl;
+        audio.currentTime = 0;
+        setCurrentTime(0);
+        setDuration(currentTrack.duration);
+        audio.load();
       }
     }
     if (smartAiEnabled) {
       triggerAiProfiling(currentTrack);
     }
-  }, [currentIndex, resolvedAudioUrl]);
+  }, [currentTrack.id, resolvedAudioUrl]);
 
   const togglePlay = async () => {
     initAudioContext();
     const audio = audioRef.current;
     if (!audio) return;
+
     if (isPlaying) {
-      pendingPlayRef.current = false;
+      shouldPlayOnLoadRef.current = false;
       audio.pause();
       setIsPlaying(false);
-    } else {
-      try {
-        if (audio.error || audio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
-          const fallback = createFallbackWavUrl(
-            currentTrack.id,
-            currentTrack.genre,
-            currentTrack.duration
-          );
-          pendingPlayRef.current = true;
-          setFallbackUrls((prev) => ({ ...prev, [currentTrack.id]: fallback }));
-          return;
-        }
-        await audio.play();
-        setIsPlaying(true);
-      } catch (err) {
-        console.warn('Switching to synthesized WAV fallback:', err);
+      return;
+    }
+
+    if (!resolvedAudioUrl) {
+      setIsPlaying(false);
+      return;
+    }
+
+    try {
+      if (loadedSrcRef.current !== resolvedAudioUrl) {
+        loadedSrcRef.current = resolvedAudioUrl;
+        audio.src = resolvedAudioUrl;
+        audio.load();
+      }
+      if (audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+        shouldPlayOnLoadRef.current = true;
+      }
+      await audio.play();
+      shouldPlayOnLoadRef.current = false;
+      setIsPlaying(true);
+    } catch (err) {
+      if (!currentTrack.isImported) {
+        console.warn('Demo track failed, switching to local WAV fallback:', err);
         const fallback = createFallbackWavUrl(
           currentTrack.id,
           currentTrack.genre,
           currentTrack.duration
         );
-        pendingPlayRef.current = true;
+        shouldPlayOnLoadRef.current = true;
         setFallbackUrls((prev) => ({ ...prev, [currentTrack.id]: fallback }));
+      } else {
+        console.warn('Unable to play imported audio track:', err);
+        shouldPlayOnLoadRef.current = false;
+        setIsPlaying(false);
       }
     }
   };
 
   const handleSelectTrack = (index: number) => {
+    if (index < 0 || index >= playlist.length) return;
     initAudioContext();
-    pendingPlayRef.current = true;
-    if (index === currentIndex && audioRef.current) {
+    const targetTrack = playlist[index];
+    const targetHasAudio = targetTrack.isImported ? Boolean(targetTrack.url) : true;
+
+    shouldPlayOnLoadRef.current = targetHasAudio;
+    if (index === currentIndex && audioRef.current && targetHasAudio) {
       audioRef.current.currentTime = 0;
-      audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
+      audioRef.current
+        .play()
+        .then(() => {
+          shouldPlayOnLoadRef.current = false;
+          setIsPlaying(true);
+        })
+        .catch(() => {});
       return;
     }
+
     setCurrentIndex(index);
-    setIsPlaying(true);
+    setIsPlaying(targetHasAudio);
   };
 
   const handleNext = () => {
+    if (playlist.length === 0) return;
+    shouldPlayOnLoadRef.current = isPlaying;
     if (shuffle && playlist.length > 1) {
       let nextIdx = Math.floor(Math.random() * playlist.length);
       if (nextIdx === currentIndex) nextIdx = (currentIndex + 1) % playlist.length;
@@ -329,6 +461,8 @@ export default function App() {
   };
 
   const handlePrev = () => {
+    if (playlist.length === 0) return;
+    shouldPlayOnLoadRef.current = isPlaying;
     setCurrentIndex((prev) => (prev - 1 + playlist.length) % playlist.length);
   };
 
@@ -337,7 +471,14 @@ export default function App() {
       audioRef.current.currentTime = 0;
       audioRef.current.play().catch((e) => console.error(e));
     } else {
-      handleNext();
+      shouldPlayOnLoadRef.current = true;
+      if (shuffle && playlist.length > 1) {
+        let nextIdx = Math.floor(Math.random() * playlist.length);
+        if (nextIdx === currentIndex) nextIdx = (currentIndex + 1) % playlist.length;
+        setCurrentIndex(nextIdx);
+      } else {
+        setCurrentIndex((prev) => (prev + 1) % playlist.length);
+      }
     }
   };
 
@@ -404,16 +545,42 @@ export default function App() {
     );
   };
 
+  const handleRelinkTrack = async (trackId: string, file: File) => {
+    const objectUrl = URL.createObjectURL(file);
+    await saveTrackBlob(trackId, file);
+    const actualDuration = await readAudioDuration(file);
+    shouldPlayOnLoadRef.current = true;
+    setPlaylist((prev) =>
+      prev.map((t) =>
+        t.id === trackId
+          ? {
+              ...t,
+              url: objectUrl,
+              duration: actualDuration,
+              hasAudioData: true
+            }
+          : t
+      )
+    );
+    setIsPlaying(true);
+  };
+
   const handleRemoveTrack = (trackId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const removeIdx = playlist.findIndex((t) => t.id === trackId);
     if (removeIdx === -1) return;
 
+    const removed = playlist[removeIdx];
+    if (removed?.url?.startsWith('blob:')) {
+      URL.revokeObjectURL(removed.url);
+    }
+    void deleteTrackBlob(trackId);
+
     const updated = playlist.filter((t) => t.id !== trackId);
     setPlaylist(updated);
 
     if (removeIdx === currentIndex) {
-      pendingPlayRef.current = false;
+      shouldPlayOnLoadRef.current = false;
       setIsPlaying(false);
       setCurrentIndex(Math.max(0, Math.min(currentIndex, updated.length - 1)));
     } else if (removeIdx < currentIndex) {
@@ -425,55 +592,136 @@ export default function App() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const fileList = Array.from(files);
+    const audioFiles = Array.from(files).filter(
+      (file) =>
+        file.type.startsWith('audio/') ||
+        /\.(mp3|wav|ogg|flac|m4a|aac|opus|wma|webm)$/i.test(file.name)
+    );
+    e.target.value = '';
+    if (audioFiles.length === 0) return;
+
     const baseTime = Date.now();
 
-    const newTracks: Track[] = fileList.map((file, idx) => ({
-      id: `sdcard-${baseTime}-${idx}`,
-      title: file.name.replace(/\.[^/.]+$/, ''),
-      artist: 'Local SD Card',
-      album: 'Imported Audio',
-      folder: '/SDCard/Music/Imported',
-      duration: 180,
-      url: URL.createObjectURL(file),
-      coverAccent: 'from-cyan-600/80 to-slate-900',
-      genre: 'Synthwave',
-      isFavorite: false,
-      isImported: true,
-      hasAudioData: true
-    }));
+    const parsedTracks: Track[] = audioFiles.map((file, idx) => {
+      const rawName = file.name.replace(/\.[^/.]+$/, '');
+      const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || '';
+      const pathParts = relPath.split('/').filter(Boolean);
+      const folderSegments = pathParts.slice(0, -1);
+      const folderPath =
+        folderSegments.length > 0 ? `/SDCard/${folderSegments.join('/')}` : '/SDCard/Music/Imported';
+      const parentAlbum =
+        folderSegments.length > 0 ? folderSegments[folderSegments.length - 1] : 'Imported Audio';
 
-    e.target.value = '';
+      let parsedArtist = 'Local Device';
+      let parsedTitle = rawName;
+      const dashIdx = rawName.indexOf(' - ');
+      if (dashIdx > 0 && dashIdx < rawName.length - 3) {
+        parsedArtist = rawName.slice(0, dashIdx).trim() || 'Local Device';
+        parsedTitle = rawName.slice(dashIdx + 3).trim() || rawName;
+      }
 
-    const nextIndex = playlist.length;
-    setPlaylist((prev) => [...prev, ...newTracks]);
-    if (!isPlaying) {
-      setCurrentIndex(nextIndex);
+      return {
+        id: `sdcard-${baseTime}-${idx}`,
+        title: parsedTitle,
+        artist: parsedArtist,
+        album: parentAlbum,
+        folder: folderPath,
+        duration: 180,
+        url: URL.createObjectURL(file),
+        coverAccent: 'from-cyan-600/80 to-slate-900',
+        genre: 'Synthwave',
+        isFavorite: false,
+        isImported: true,
+        hasAudioData: true
+      };
+    });
+
+    const firstAddedTrackKey = `${parsedTracks[0].folder}::${parsedTracks[0].title}`;
+    const resolvedIdsForFiles: string[] = [];
+
+    const mergedPlaylist = [...playlist];
+    for (let idx = 0; idx < parsedTracks.length; idx++) {
+      const item = parsedTracks[idx];
+      const existingIdx = mergedPlaylist.findIndex(
+        (t) => t.isImported && `${t.folder}::${t.title}` === `${item.folder}::${item.title}`
+      );
+      if (existingIdx !== -1) {
+        const existingId = mergedPlaylist[existingIdx].id;
+        resolvedIdsForFiles.push(existingId);
+        mergedPlaylist[existingIdx] = {
+          ...mergedPlaylist[existingIdx],
+          url: item.url,
+          hasAudioData: true
+        };
+      } else {
+        resolvedIdsForFiles.push(item.id);
+        mergedPlaylist.push(item);
+      }
     }
 
-    // Extract actual track duration and persistable data URL for localStorage
+    // Persist full audio blobs into IndexedDB so large MP3s survive refreshes
+    void Promise.all(
+      audioFiles.map((file, idx) => saveTrackBlob(resolvedIdsForFiles[idx], file))
+    );
+
+    // Clear any old fallback cache for updated tracks
+    setFallbackUrls((prev) => {
+      const next = { ...prev };
+      for (const id of resolvedIdsForFiles) delete next[id];
+      return next;
+    });
+
+    setPlaylist(mergedPlaylist);
+    if (!isPlaying) {
+      const targetIdx = mergedPlaylist.findIndex(
+        (t) => `${t.folder}::${t.title}` === firstAddedTrackKey
+      );
+      if (targetIdx !== -1) setCurrentIndex(targetIdx);
+    }
+
+    // Extract embedded ID3v1/v2 tags and actual audio duration asynchronously
     const enriched = await Promise.all(
-      fileList.map(async (file, idx) => {
-        const meta = await readImportedAudioFile(file);
+      audioFiles.map(async (file, idx) => {
+        const [durationSecs, id3] = await Promise.all([
+          readAudioDuration(file),
+          parseId3Tags(file)
+        ]);
         return {
-          id: `sdcard-${baseTime}-${idx}`,
-          ...meta
+          id: resolvedIdsForFiles[idx],
+          duration: durationSecs,
+          id3
         };
       })
     );
 
-    setPlaylist((prev) =>
-      prev.map((track) => {
-        const match = enriched.find((item) => item.id === track.id);
-        if (!match) return track;
-        return {
-          ...track,
-          duration: match.duration,
-          url: match.persistableUrl || track.url,
-          hasAudioData: Boolean(match.persistableUrl)
-        };
-      })
-    );
+    const enrichedById = new Map(enriched.map((item) => [item.id, item]));
+    const applyId3Updates = (track: Track): Track => {
+      const match = enrichedById.get(track.id);
+      if (!match) return track;
+      const { id3 } = match;
+      return {
+        ...track,
+        duration: match.duration,
+        title: id3.title || track.title,
+        artist: id3.artist || track.artist,
+        album: id3.album || track.album,
+        genre: id3.genre || track.genre,
+        id3Genre: id3.genre,
+        bpm: id3.bpm,
+        year: id3.year,
+        hasId3Tags: id3.hasId3Tags
+      };
+    };
+
+    setPlaylist((prev) => prev.map(applyId3Updates));
+
+    if (smartAiEnabled) {
+      const targetId = isPlaying ? playlist[currentIndex]?.id : resolvedIdsForFiles[0];
+      const baseTarget = mergedPlaylist.find((t) => t.id === targetId);
+      if (baseTarget) {
+        void triggerAiProfiling(applyId3Updates(baseTarget));
+      }
+    }
   };
 
   const clearFilters = () => {
@@ -531,6 +779,7 @@ export default function App() {
           dspEnabled={dspEnabled}
           bassBoost={bassBoost}
           smartAiEnabled={smartAiEnabled}
+          isProfilingAi={isProfilingAi}
           aiStatus={aiStatus}
           eqControlStyle={eqControlStyle}
           band60Hz={band60Hz}
@@ -543,9 +792,10 @@ export default function App() {
           onToggleSmartAi={() => {
             const next = !smartAiEnabled;
             setSmartAiEnabled(next);
-            if (next) triggerAiProfiling(currentTrack);
+            if (next) void triggerAiProfiling(currentTrack);
             else setAiStatus(null);
           }}
+          onRunAiProfile={() => void triggerAiProfiling(currentTrack)}
           onChangeControlStyle={setEqControlStyle}
           onChangeBand={handleBandChange}
           onApplyPreset={applyPreset}
@@ -566,19 +816,18 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#090d12] text-slate-100 flex flex-col">
+    <div className="min-h-screen cyber-synthwave-bg text-slate-100 flex flex-col">
       <NeonRippleOverlay />
-      {/* Persistent Audio Element */}
+      {/* Persistent Audio Element (src managed imperatively in useEffect) */}
       <audio
         ref={audioRef}
-        src={resolvedAudioUrl}
         preload="auto"
         onTimeUpdate={handleTimeUpdate}
         onEnded={handleEnded}
         onLoadedMetadata={handleTimeUpdate}
         onCanPlay={() => {
-          if (pendingPlayRef.current && audioRef.current) {
-            pendingPlayRef.current = false;
+          if (shouldPlayOnLoadRef.current && audioRef.current && loadedSrcRef.current) {
+            shouldPlayOnLoadRef.current = false;
             audioRef.current
               .play()
               .then(() => setIsPlaying(true))
@@ -586,7 +835,8 @@ export default function App() {
           }
         }}
         onError={() => {
-          if (!fallbackUrls[currentTrack.id]) {
+          if (!loadedSrcRef.current) return;
+          if (!currentTrack.isImported && !fallbackUrls[currentTrack.id]) {
             const fallback = createFallbackWavUrl(
               currentTrack.id,
               currentTrack.genre,
@@ -594,21 +844,26 @@ export default function App() {
             );
             setFallbackUrls((prev) => ({ ...prev, [currentTrack.id]: fallback }));
           } else {
-            pendingPlayRef.current = false;
+            shouldPlayOnLoadRef.current = false;
             setIsPlaying(false);
           }
         }}
       />
 
       {/* Clean Single-Row Studio Header */}
-      <header className="h-14 border-b border-white/[0.08] bg-[#0e141c]/90 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-3 sticky top-0 z-30">
+      <header className="h-14 border-b border-white/[0.08] bg-[#0e141c]/90 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-3 sticky top-0 z-30 shrink-0">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/35 flex items-center justify-center shrink-0">
             <Radio className="w-4 h-4 text-cyan-400" />
           </div>
-          <h1 className="text-sm sm:text-base font-semibold tracking-tight text-white truncate">
-            DSP Audio Studio
-          </h1>
+          <div className="min-w-0">
+            <h1 className="text-sm sm:text-base font-semibold tracking-tight text-white truncate">
+              DSP Audio Studio
+            </h1>
+            <p className="hidden md:block text-[10px] font-mono text-slate-400 truncate">
+              Rust + Iced UI Blueprint · {playlist.length} tracks
+            </p>
+          </div>
         </div>
 
         {/* Viewport Switcher (Desktop 950px / Mobile 360px Blueprint Preview) */}
@@ -659,18 +914,18 @@ export default function App() {
       </header>
 
       {/* Main Studio Canvas */}
-      <main className="flex-1 flex items-center justify-center p-2 sm:p-6">
+      <main className="flex-1 min-h-0 flex items-center justify-center p-2 sm:p-4">
         {isCompactLayout ? (
-          /* ================= MOBILE APP SHELL (360px Blueprint) ================= */
+          /* ================= MOBILE APP SHELL (360x600 Blueprint) ================= */
           <div
-            className={`w-full flex flex-col bg-[#111720] border border-white/10 overflow-hidden ${
+            className={`w-full flex flex-col bg-[#111720]/95 backdrop-blur-md border border-white/10 overflow-hidden ${
               previewMode === 'mobile'
-                ? 'max-w-[360px] h-[640px] rounded-[28px] shadow-2xl'
-                : 'max-w-md h-[calc(100vh-5rem)] rounded-2xl'
+                ? 'max-w-[360px] h-[min(600px,calc(100dvh-7.5rem))] rounded-[26px] shadow-2xl'
+                : 'max-w-md h-[calc(100dvh-7.5rem)] rounded-2xl'
             }`}
           >
             {/* Mobile Active Screen */}
-            <div className="flex-1 min-h-0 overflow-y-auto p-4">
+            <div className="flex-1 min-h-0 overflow-y-auto p-3.5">
               {mobileTab === 'player' ? (
                 <PlayerPanel
                   track={currentTrack}
@@ -685,7 +940,6 @@ export default function App() {
                   shuffle={shuffle}
                   dspEnabled={dspEnabled}
                   bassBoost={bassBoost}
-                  visualizerStyle={visualizerStyle}
                   analyserRef={analyserRef}
                   onTogglePlay={togglePlay}
                   onPrev={handlePrev}
@@ -696,8 +950,8 @@ export default function App() {
                   onToggleLoop={() => setLoop(!loop)}
                   onToggleShuffle={() => setShuffle(!shuffle)}
                   onToggleFavorite={(id) => toggleFavorite(id)}
-                  onChangeVisualizer={setVisualizerStyle}
                   onZoomVolume={setZoomedKnob}
+                  onRelinkTrack={handleRelinkTrack}
                 />
               ) : (
                 renderWorkspaceContent(mobileTab)
@@ -733,10 +987,11 @@ export default function App() {
                     key={tab.id}
                     type="button"
                     onClick={() => setMobileTab(tab.id)}
-                    className={`h-14 flex flex-col items-center justify-center gap-1 transition-colors ${
+                    className={`h-13 flex flex-col items-center justify-center gap-0.5 transition-colors relative ${
                       active ? 'text-cyan-400' : 'text-slate-500 hover:text-slate-300'
                     }`}
                   >
+                    {active && <span className="absolute top-0 w-8 h-0.5 rounded-full bg-cyan-400" />}
                     {tab.icon}
                     <span className="text-[10px] font-medium">{tab.label}</span>
                   </button>
@@ -747,16 +1002,16 @@ export default function App() {
         ) : (
           /* ================= DESKTOP SPLIT WORKSPACE (950x650 Blueprint) ================= */
           <div
-            className={`w-full bg-[#111720] border border-white/10 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${
+            className={`w-full bg-[#111720]/95 backdrop-blur-md border border-white/10 rounded-2xl shadow-2xl flex flex-col overflow-hidden ${
               previewMode === 'desktop'
-                ? 'max-w-[950px] h-[650px]'
-                : 'max-w-5xl h-[650px]'
+                ? 'max-w-[950px] h-[min(650px,calc(100dvh-7.5rem))]'
+                : 'max-w-5xl h-[min(650px,calc(100dvh-7.5rem))]'
             }`}
           >
             <div className="flex-1 min-h-0 flex">
               {/* Left Pane: Full Player (hidden cleanly when collapsed to Mini mode) */}
               {!isMiniPlayer && (
-                <section className="w-[390px] shrink-0 border-r border-white/[0.08] p-5 flex flex-col">
+                <section className="w-[390px] shrink-0 border-r border-white/[0.08] p-4 sm:p-5 flex flex-col">
                   <PlayerPanel
                     track={currentTrack}
                     trackIndex={currentIndex}
@@ -770,7 +1025,6 @@ export default function App() {
                     shuffle={shuffle}
                     dspEnabled={dspEnabled}
                     bassBoost={bassBoost}
-                    visualizerStyle={visualizerStyle}
                     analyserRef={analyserRef}
                     showCollapseButton={true}
                     onTogglePlay={togglePlay}
@@ -782,17 +1036,17 @@ export default function App() {
                     onToggleLoop={() => setLoop(!loop)}
                     onToggleShuffle={() => setShuffle(!shuffle)}
                     onToggleFavorite={(id) => toggleFavorite(id)}
-                    onChangeVisualizer={setVisualizerStyle}
                     onZoomVolume={setZoomedKnob}
                     onCollapseMini={() => setIsMiniPlayer(true)}
+                    onRelinkTrack={handleRelinkTrack}
                   />
                 </section>
               )}
 
               {/* Right Pane: Tabbed Studio Workspace */}
               <section className="flex-1 min-w-0 flex flex-col">
-                <div className="h-12 px-5 border-b border-white/[0.08] flex items-center justify-between gap-2 shrink-0 bg-[#0e141c]/60">
-                  <div className="flex items-center gap-1">
+                <div className="h-12 px-5 border-b border-white/[0.08] flex items-center justify-between gap-2 shrink-0 bg-[#0e141c]/80">
+                  <div className="flex items-center gap-1.5">
                     {workspaceTabs.map((tab) => {
                       const active = workspaceTab === tab.id;
                       return (
@@ -800,10 +1054,10 @@ export default function App() {
                           key={tab.id}
                           type="button"
                           onClick={() => setWorkspaceTab(tab.id)}
-                          className={`h-8 px-3 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors ${
+                          className={`h-8 px-3 rounded-lg text-xs font-medium flex items-center gap-2 border transition-colors ${
                             active
-                              ? 'bg-cyan-500/15 text-cyan-300 font-semibold'
-                              : 'text-slate-400 hover:text-white hover:bg-white/5'
+                              ? 'bg-cyan-500/15 border-cyan-500/35 text-cyan-300 font-semibold'
+                              : 'border-transparent text-slate-400 hover:text-white hover:bg-white/5'
                           }`}
                         >
                           {tab.icon}
@@ -818,7 +1072,7 @@ export default function App() {
                   </span>
                 </div>
 
-                <div className="flex-1 min-h-0 p-5 overflow-hidden">
+                <div className="flex-1 min-h-0 p-4 sm:p-5 overflow-hidden">
                   {renderWorkspaceContent(workspaceTab)}
                 </div>
               </section>
@@ -846,6 +1100,16 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Studio Performance HUD Footer */}
+      <PerformanceHud
+        audioCtxRef={audioCtxRef}
+        analyserRef={analyserRef}
+        isPlaying={isPlaying}
+        dspEnabled={dspEnabled}
+        bassBoost={bassBoost}
+        sampleRateSetting={sampleRate}
+      />
 
       {/* Double-Tap Precision Knob Wheel */}
       <KnobZoomModal

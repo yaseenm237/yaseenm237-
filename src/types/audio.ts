@@ -21,6 +21,8 @@ export interface Track {
 
 export type VisualizerStyle = 'waterfall' | 'waterfall_3d' | 'history' | 'bars' | 'particle_blast' | 'waveform' | 'oscilloscope' | 'circular' | 'particles';
 
+export type VisualizerTheme = 'cyber_cyan' | 'sunset_pink' | 'monochrome_white';
+
 export type LibraryTab = 'tracks' | 'local' | 'albums' | 'artists' | 'folders' | 'favorites';
 
 export type EqPreset = 'flat' | 'cyber' | 'rock' | 'electronic' | 'vocal' | 'acoustic';

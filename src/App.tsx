@@ -16,6 +16,7 @@ import {
   MobileTab,
   PreviewMode,
   Track,
+  VisualizerTheme,
   WorkspaceTab,
   ZoomedKnobTarget
 } from './types/audio';
@@ -106,6 +107,16 @@ export default function App() {
   // DSP Equalizer State
   const [dspEnabled, setDspEnabled] = useState(true);
   const [bassBoost, setBassBoost] = useState(true);
+  const [autoGainEnabled, setAutoGainEnabled] = useState(true);
+  const [autoGainDb, setAutoGainDb] = useState(0);
+  const [crossfadeDuration, setCrossfadeDuration] = useState(2.0);
+  const [visualizerTheme, setVisualizerTheme] = useState<VisualizerTheme>(() => {
+    if (typeof window === 'undefined' || !window.localStorage) return 'cyber_cyan';
+    const saved = window.localStorage.getItem('dsp_visualizer_theme_v1') as VisualizerTheme | null;
+    return saved === 'cyber_cyan' || saved === 'sunset_pink' || saved === 'monochrome_white'
+      ? saved
+      : 'cyber_cyan';
+  });
   const [band60Hz, setBand60Hz] = useState(4.5);
   const [band250Hz, setBand250Hz] = useState(2.0);
   const [band1kHz, setBand1kHz] = useState(-1.0);
@@ -124,7 +135,18 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
+  const crossfadeGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const autoGainTrimRef = useRef(1.0);
+  const agcFloatBufRef = useRef<Float32Array<ArrayBuffer>>(new Float32Array(128));
+  const agcByteBufRef = useRef<Uint8Array<ArrayBuffer>>(new Uint8Array(128));
+  const crossfadeDurationRef = useRef(crossfadeDuration);
+  crossfadeDurationRef.current = crossfadeDuration;
+  const isCrossfadingRef = useRef(false);
+  const autoFadeTriggeredRef = useRef(false);
+  const pendingFadeInRef = useRef(0);
+  const crossfadeTimerRef = useRef<number | null>(null);
+  const crossfadeEndTimerRef = useRef<number | null>(null);
 
   const filter60Ref = useRef<BiquadFilterNode | null>(null);
   const filter250Ref = useRef<BiquadFilterNode | null>(null);
@@ -135,6 +157,9 @@ export default function App() {
   const aiTimerRef = useRef<number | null>(null);
   const aiAbortRef = useRef<AbortController | null>(null);
   const aiRequestSeqRef = useRef(0);
+  const aiProfileCacheRef = useRef<
+    Map<string, { detectedGenre: string; preset: EqPreset; reason?: string; source?: string }>
+  >(new Map());
 
   useEffect(() => {
     const onResize = () => setIsNarrowScreen(window.innerWidth < 900);
@@ -164,6 +189,7 @@ export default function App() {
       if (audioRef.current) {
         const source = ctx.createMediaElementSource(audioRef.current);
         sourceNodeRef.current = source;
+        audioRef.current.volume = 1;
 
         const f60 = ctx.createBiquadFilter();
         f60.type = 'lowshelf';
@@ -205,8 +231,14 @@ export default function App() {
         bassBoostRef.current = fBass;
 
         const gainNode = ctx.createGain();
-        gainNode.gain.value = isMuted ? 0 : volume / 100;
+        gainNode.gain.value = isMuted
+          ? 0
+          : (volume / 100) * (autoGainEnabled ? autoGainTrimRef.current : 1);
         gainNodeRef.current = gainNode;
+
+        const crossfadeGain = ctx.createGain();
+        crossfadeGain.gain.value = 1.0;
+        crossfadeGainRef.current = crossfadeGain;
 
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 128;
@@ -220,6 +252,7 @@ export default function App() {
           .connect(f16k)
           .connect(fBass)
           .connect(gainNode)
+          .connect(crossfadeGain)
           .connect(analyser)
           .connect(ctx.destination);
       }
@@ -228,16 +261,143 @@ export default function App() {
     }
   };
 
-  // Sync volume
+  // Sync master volume & Auto-Gain trim without double-attenuating once Web Audio is connected
   useEffect(() => {
-    if (audioRef.current) audioRef.current.volume = isMuted ? 0 : volume / 100;
-    if (gainNodeRef.current && audioCtxRef.current) {
-      gainNodeRef.current.gain.setValueAtTime(
-        isMuted ? 0 : volume / 100,
-        audioCtxRef.current.currentTime
-      );
+    const userLinear = isMuted ? 0 : volume / 100;
+    if (audioRef.current) {
+      audioRef.current.volume = sourceNodeRef.current ? 1 : userLinear;
     }
-  }, [volume, isMuted]);
+    if (gainNodeRef.current && audioCtxRef.current) {
+      const totalGain = userLinear * (autoGainEnabled ? autoGainTrimRef.current : 1);
+      gainNodeRef.current.gain.setTargetAtTime(totalGain, audioCtxRef.current.currentTime, 0.015);
+    }
+  }, [volume, isMuted, autoGainEnabled]);
+
+  // Reset Auto-Gain trim smoothly when switching tracks so quiet tracks don't inherit previous cuts
+  useEffect(() => {
+    autoGainTrimRef.current = 1.0;
+    setAutoGainDb(0);
+    if (gainNodeRef.current && audioCtxRef.current) {
+      const userLinear = isMuted ? 0 : volume / 100;
+      gainNodeRef.current.gain.setTargetAtTime(userLinear, audioCtxRef.current.currentTime, 0.02);
+    }
+  }, [currentTrack.id]);
+
+  // Real-time AnalyserNode-driven Auto-Gain & anti-clipping ceiling limiter
+  useEffect(() => {
+    if (!autoGainEnabled) {
+      autoGainTrimRef.current = 1.0;
+      setAutoGainDb(0);
+      if (gainNodeRef.current && audioCtxRef.current) {
+        const userLinear = isMuted ? 0 : volume / 100;
+        gainNodeRef.current.gain.setTargetAtTime(userLinear, audioCtxRef.current.currentTime, 0.04);
+      }
+      return;
+    }
+
+    if (!isPlaying) return;
+
+    let rafId = 0;
+    let lastTime = performance.now();
+    let lastUiSync = 0;
+
+    const tick = (now: number) => {
+      rafId = requestAnimationFrame(tick);
+
+      const dt = Math.min(0.1, Math.max(0.001, (now - lastTime) / 1000));
+      lastTime = now;
+
+      const analyser = analyserRef.current;
+      const gainNode = gainNodeRef.current;
+      const ctx = audioCtxRef.current;
+      const userLinear = isMuted ? 0 : volume / 100;
+
+      if (!analyser || !gainNode || !ctx || userLinear <= 0.01 || isCrossfadingRef.current) return;
+
+      const sampleCount = analyser.fftSize;
+      let postPeak = 0;
+      let sumSq = 0;
+
+      if (typeof analyser.getFloatTimeDomainData === 'function') {
+        if (agcFloatBufRef.current.length !== sampleCount) {
+          agcFloatBufRef.current = new Float32Array(sampleCount);
+        }
+        const buf = agcFloatBufRef.current;
+        analyser.getFloatTimeDomainData(buf);
+        for (let i = 0; i < buf.length; i++) {
+          const s = buf[i];
+          const abs = s < 0 ? -s : s;
+          if (abs > postPeak) postPeak = abs;
+          sumSq += s * s;
+        }
+      } else {
+        if (agcByteBufRef.current.length !== sampleCount) {
+          agcByteBufRef.current = new Uint8Array(sampleCount);
+        }
+        const buf = agcByteBufRef.current;
+        analyser.getByteTimeDomainData(buf);
+        for (let i = 0; i < buf.length; i++) {
+          const s = (buf[i] - 128) / 128;
+          const abs = s < 0 ? -s : s;
+          if (abs > postPeak) postPeak = abs;
+          sumSq += s * s;
+        }
+      }
+
+      const postRms = Math.sqrt(sumSq / sampleCount);
+      const currentTrim = autoGainTrimRef.current;
+      const appliedGain = Math.max(0.02, userLinear * currentTrim);
+
+      // Estimate true pre-GainNode amplitude to avoid feedback pumping
+      const prePeak = postPeak / appliedGain;
+      const preRms = postRms / appliedGain;
+
+      const TARGET_RMS = 0.22; // ~ -13.1 dBFS reference loudness
+      const CLIP_CEILING = 0.89; // ~ -1.0 dBFS anti-clipping headroom
+      const MIN_TRIM = 0.28; // ~ -11.1 dB max attenuation
+      const MAX_TRIM = 1.45; // ~ +3.2 dB max boost
+
+      let loudnessTrim = currentTrim;
+      if (preRms > 0.012) {
+        loudnessTrim = Math.min(MAX_TRIM, Math.max(MIN_TRIM, TARGET_RMS / preRms));
+      } else {
+        // Silence or fade tail: drift smoothly back to unity
+        loudnessTrim = currentTrim + (1.0 - currentTrim) * (1 - Math.exp(-dt / 0.8));
+      }
+
+      const safePeakTrim =
+        prePeak * userLinear > 0.001 ? CLIP_CEILING / (prePeak * userLinear) : MAX_TRIM;
+
+      const desiredTrim = Math.min(
+        MAX_TRIM,
+        Math.max(MIN_TRIM, Math.min(loudnessTrim, safePeakTrim))
+      );
+
+      // Fast attack on hot peaks; slow smooth release on quiet swells
+      const isAttenuating = desiredTrim < currentTrim;
+      const tau = isAttenuating ? (postPeak > CLIP_CEILING ? 0.008 : 0.03) : 0.55;
+      const alpha = 1 - Math.exp(-dt / tau);
+      const nextTrim = currentTrim + (desiredTrim - currentTrim) * alpha;
+
+      autoGainTrimRef.current = nextTrim;
+      const targetTotalGain = userLinear * nextTrim;
+      gainNode.gain.setTargetAtTime(
+        targetTotalGain,
+        ctx.currentTime,
+        isAttenuating ? 0.012 : 0.06
+      );
+
+      if (now - lastUiSync >= 180) {
+        lastUiSync = now;
+        const db = 20 * Math.log10(Math.max(0.05, nextTrim));
+        const rounded = Math.round(db * 10) / 10;
+        setAutoGainDb((prev) => (prev === rounded ? prev : rounded));
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [autoGainEnabled, isPlaying, volume, isMuted]);
 
   // Sync EQ biquad filters
   useEffect(() => {
@@ -281,9 +441,25 @@ export default function App() {
     return 'flat';
   };
 
-  const triggerAiProfiling = async (track: Track) => {
+  const triggerAiProfiling = async (track: Track, forceRefresh = false) => {
     if (aiTimerRef.current) window.clearTimeout(aiTimerRef.current);
     if (aiAbortRef.current) aiAbortRef.current.abort();
+
+    const cacheKey = `${track.id}::${track.title}::${track.artist}::${track.id3Genre || track.genre}`;
+    if (!forceRefresh) {
+      const cached = aiProfileCacheRef.current.get(cacheKey);
+      if (cached) {
+        applyPreset(cached.preset);
+        const modeTag = cached.source === 'gemini-ai' ? 'AI Profiler' : 'ID3 Profiler';
+        setAiStatus(
+          `${modeTag}: ${cached.detectedGenre} -> ${EQ_PRESETS[cached.preset].label}${
+            cached.reason ? ` · ${cached.reason}` : ''
+          }`
+        );
+        aiTimerRef.current = window.setTimeout(() => setAiStatus(null), 4000);
+        return;
+      }
+    }
 
     const seq = ++aiRequestSeqRef.current;
     const controller = new AbortController();
@@ -330,6 +506,13 @@ export default function App() {
         );
       }
 
+      aiProfileCacheRef.current.set(cacheKey, {
+        detectedGenre: detected,
+        preset: chosenPreset,
+        reason: data.reason,
+        source: data.source
+      });
+
       const modeTag = data.source === 'gemini-ai' ? 'AI Profiler' : 'ID3 Profiler';
       setAiStatus(
         `${modeTag}: ${detected} -> ${EQ_PRESETS[chosenPreset].label}${data.reason ? ` · ${data.reason}` : ''}`
@@ -373,10 +556,106 @@ export default function App() {
         audio.load();
       }
     }
-    if (smartAiEnabled) {
-      triggerAiProfiling(currentTrack);
-    }
   }, [currentTrack.id, resolvedAudioUrl]);
+
+  // Run Smart Genre Profiler once per active track change when enabled
+  useEffect(() => {
+    if (smartAiEnabled) {
+      void triggerAiProfiling(currentTrack);
+    }
+  }, [currentTrack.id]);
+
+  const clearCrossfadeTimers = () => {
+    if (crossfadeTimerRef.current) {
+      window.clearTimeout(crossfadeTimerRef.current);
+      crossfadeTimerRef.current = null;
+    }
+    if (crossfadeEndTimerRef.current) {
+      window.clearTimeout(crossfadeEndTimerRef.current);
+      crossfadeEndTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => clearCrossfadeTimers();
+  }, []);
+
+  const triggerCrossfadeIn = (durationSecs: number) => {
+    const cfNode = crossfadeGainRef.current;
+    const ctx = audioCtxRef.current;
+    if (!cfNode || !ctx) {
+      isCrossfadingRef.current = false;
+      return;
+    }
+    const t = ctx.currentTime;
+    cfNode.gain.cancelScheduledValues(t);
+    if (durationSecs <= 0.02) {
+      cfNode.gain.setValueAtTime(1.0, t);
+      isCrossfadingRef.current = false;
+      return;
+    }
+    isCrossfadingRef.current = true;
+    cfNode.gain.setValueAtTime(0.001, t);
+    cfNode.gain.linearRampToValueAtTime(1.0, t + durationSecs);
+    if (crossfadeEndTimerRef.current) window.clearTimeout(crossfadeEndTimerRef.current);
+    crossfadeEndTimerRef.current = window.setTimeout(() => {
+      isCrossfadingRef.current = false;
+      crossfadeEndTimerRef.current = null;
+    }, durationSecs * 1000 + 60);
+  };
+
+  const resetCrossfadeUnity = () => {
+    clearCrossfadeTimers();
+    isCrossfadingRef.current = false;
+    autoFadeTriggeredRef.current = false;
+    pendingFadeInRef.current = 0;
+    const cfNode = crossfadeGainRef.current;
+    const ctx = audioCtxRef.current;
+    if (cfNode && ctx) {
+      const t = ctx.currentTime;
+      cfNode.gain.cancelScheduledValues(t);
+      cfNode.gain.setValueAtTime(cfNode.gain.value, t);
+      cfNode.gain.setTargetAtTime(1.0, t, 0.02);
+    }
+  };
+
+  const transitionToTrackIndex = (
+    targetIndex: number,
+    rampOutSecs: number,
+    rampInSecs: number,
+    autoPlayOverride?: boolean
+  ) => {
+    clearCrossfadeTimers();
+    const targetTrack = playlist[targetIndex];
+    if (!targetTrack) return;
+    const targetHasAudio = targetTrack.isImported ? Boolean(targetTrack.url) : true;
+    const shouldPlay = autoPlayOverride !== undefined ? autoPlayOverride : targetHasAudio;
+
+    const commitSwitch = () => {
+      shouldPlayOnLoadRef.current = shouldPlay;
+      pendingFadeInRef.current = shouldPlay ? rampInSecs : 0;
+      autoFadeTriggeredRef.current = false;
+      setCurrentIndex(targetIndex);
+      setIsPlaying(shouldPlay);
+    };
+
+    const cfNode = crossfadeGainRef.current;
+    const ctx = audioCtxRef.current;
+    if (isPlaying && shouldPlay && rampOutSecs > 0.02 && cfNode && ctx) {
+      isCrossfadingRef.current = true;
+      const t = ctx.currentTime;
+      cfNode.gain.cancelScheduledValues(t);
+      cfNode.gain.setValueAtTime(Math.max(0.001, cfNode.gain.value), t);
+      cfNode.gain.linearRampToValueAtTime(0.001, t + rampOutSecs);
+      crossfadeTimerRef.current = window.setTimeout(() => {
+        crossfadeTimerRef.current = null;
+        commitSwitch();
+      }, rampOutSecs * 1000);
+    } else {
+      if (!shouldPlay) resetCrossfadeUnity();
+      commitSwitch();
+    }
+  };
 
   const togglePlay = async () => {
     initAudioContext();
@@ -385,6 +664,8 @@ export default function App() {
 
     if (isPlaying) {
       shouldPlayOnLoadRef.current = false;
+      clearCrossfadeTimers();
+      isCrossfadingRef.current = false;
       audio.pause();
       setIsPlaying(false);
       return;
@@ -406,6 +687,13 @@ export default function App() {
       }
       await audio.play();
       shouldPlayOnLoadRef.current = false;
+      if (pendingFadeInRef.current > 0) {
+        const fadeIn = pendingFadeInRef.current;
+        pendingFadeInRef.current = 0;
+        triggerCrossfadeIn(fadeIn);
+      } else {
+        resetCrossfadeUnity();
+      }
       setIsPlaying(true);
     } catch (err) {
       if (!currentTrack.isImported) {
@@ -431,8 +719,8 @@ export default function App() {
     const targetTrack = playlist[index];
     const targetHasAudio = targetTrack.isImported ? Boolean(targetTrack.url) : true;
 
-    shouldPlayOnLoadRef.current = targetHasAudio;
     if (index === currentIndex && audioRef.current && targetHasAudio) {
+      resetCrossfadeUnity();
       audioRef.current.currentTime = 0;
       audioRef.current
         .play()
@@ -444,49 +732,99 @@ export default function App() {
       return;
     }
 
-    setCurrentIndex(index);
-    setIsPlaying(targetHasAudio);
+    const cfSecs = crossfadeDurationRef.current;
+    if (isPlaying && cfSecs > 0 && targetHasAudio) {
+      const rampOut = Math.min(0.4, cfSecs * 0.25);
+      const rampIn = Math.min(2.5, cfSecs * 0.5);
+      transitionToTrackIndex(index, rampOut, rampIn, targetHasAudio);
+    } else {
+      resetCrossfadeUnity();
+      transitionToTrackIndex(index, 0, 0, targetHasAudio);
+    }
+  };
+
+  const getNextIndex = () => {
+    if (shuffle && playlist.length > 1) {
+      let nextIdx = Math.floor(Math.random() * playlist.length);
+      if (nextIdx === currentIndex) nextIdx = (currentIndex + 1) % playlist.length;
+      return nextIdx;
+    }
+    return (currentIndex + 1) % playlist.length;
   };
 
   const handleNext = () => {
     if (playlist.length === 0) return;
-    shouldPlayOnLoadRef.current = isPlaying;
-    if (shuffle && playlist.length > 1) {
-      let nextIdx = Math.floor(Math.random() * playlist.length);
-      if (nextIdx === currentIndex) nextIdx = (currentIndex + 1) % playlist.length;
-      setCurrentIndex(nextIdx);
+    const nextIdx = getNextIndex();
+    const cfSecs = crossfadeDurationRef.current;
+    if (isPlaying && cfSecs > 0) {
+      const rampOut = Math.min(0.4, cfSecs * 0.25);
+      const rampIn = Math.min(2.5, cfSecs * 0.5);
+      transitionToTrackIndex(nextIdx, rampOut, rampIn, true);
     } else {
-      setCurrentIndex((prev) => (prev + 1) % playlist.length);
+      resetCrossfadeUnity();
+      transitionToTrackIndex(nextIdx, 0, 0, isPlaying);
     }
   };
 
   const handlePrev = () => {
     if (playlist.length === 0) return;
-    shouldPlayOnLoadRef.current = isPlaying;
-    setCurrentIndex((prev) => (prev - 1 + playlist.length) % playlist.length);
+    const prevIdx = (currentIndex - 1 + playlist.length) % playlist.length;
+    const cfSecs = crossfadeDurationRef.current;
+    if (isPlaying && cfSecs > 0) {
+      const rampOut = Math.min(0.4, cfSecs * 0.25);
+      const rampIn = Math.min(2.5, cfSecs * 0.5);
+      transitionToTrackIndex(prevIdx, rampOut, rampIn, true);
+    } else {
+      resetCrossfadeUnity();
+      transitionToTrackIndex(prevIdx, 0, 0, isPlaying);
+    }
   };
 
   const handleEnded = () => {
     if (loop && audioRef.current) {
+      resetCrossfadeUnity();
       audioRef.current.currentTime = 0;
       audioRef.current.play().catch((e) => console.error(e));
-    } else {
-      shouldPlayOnLoadRef.current = true;
-      if (shuffle && playlist.length > 1) {
-        let nextIdx = Math.floor(Math.random() * playlist.length);
-        if (nextIdx === currentIndex) nextIdx = (currentIndex + 1) % playlist.length;
-        setCurrentIndex(nextIdx);
-      } else {
-        setCurrentIndex((prev) => (prev + 1) % playlist.length);
-      }
+      return;
     }
+
+    const cfSecs = crossfadeDurationRef.current;
+    const fadeIn =
+      cfSecs > 0 ? Math.min(cfSecs / 2, Math.max(0.25, duration * 0.25)) : 0;
+    const nextIdx = getNextIndex();
+    transitionToTrackIndex(nextIdx, 0, fadeIn, true);
   };
 
   const handleTimeUpdate = () => {
-    if (!audioRef.current) return;
-    setCurrentTime(audioRef.current.currentTime);
-    if (audioRef.current.duration && !isNaN(audioRef.current.duration)) {
-      setDuration(audioRef.current.duration);
+    const audio = audioRef.current;
+    if (!audio) return;
+    setCurrentTime(audio.currentTime);
+    if (audio.duration && !isNaN(audio.duration)) {
+      setDuration(audio.duration);
+
+      const cfSecs = crossfadeDurationRef.current;
+      if (isPlaying && !loop && cfSecs > 0 && playlist.length > 1) {
+        const halfDur = cfSecs / 2;
+        const remaining = audio.duration - audio.currentTime;
+        if (audio.duration > halfDur + 0.5) {
+          if (!autoFadeTriggeredRef.current && remaining <= halfDur && remaining > 0.08) {
+            autoFadeTriggeredRef.current = true;
+            const cfNode = crossfadeGainRef.current;
+            const ctx = audioCtxRef.current;
+            if (cfNode && ctx) {
+              isCrossfadingRef.current = true;
+              const t = ctx.currentTime;
+              const fadeOutTime = Math.max(0.08, remaining - 0.04);
+              cfNode.gain.cancelScheduledValues(t);
+              cfNode.gain.setValueAtTime(Math.max(0.001, cfNode.gain.value), t);
+              cfNode.gain.linearRampToValueAtTime(0.001, t + fadeOutTime);
+            }
+          } else if (autoFadeTriggeredRef.current && remaining <= 0.06) {
+            autoFadeTriggeredRef.current = false;
+            transitionToTrackIndex(getNextIndex(), 0, halfDur, true);
+          }
+        }
+      }
     }
   };
 
@@ -494,6 +832,14 @@ export default function App() {
     setCurrentTime(val);
     if (audioRef.current) {
       audioRef.current.currentTime = val;
+      if (
+        audioRef.current.duration &&
+        audioRef.current.duration - val > crossfadeDurationRef.current / 2 + 0.2
+      ) {
+        if (autoFadeTriggeredRef.current || isCrossfadingRef.current) {
+          resetCrossfadeUnity();
+        }
+      }
     }
   };
 
@@ -501,6 +847,96 @@ export default function App() {
     setVolume(val);
     if (isMuted && val > 0) setIsMuted(false);
   };
+
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
+
+  const shortcutActionsRef = useRef({
+    togglePlay,
+    handleNext,
+    handlePrev,
+    handleVolumeChange,
+    isModalOpen: Boolean(editingTrack || zoomedKnob)
+  });
+  shortcutActionsRef.current = {
+    togglePlay,
+    handleNext,
+    handlePrev,
+    handleVolumeChange,
+    isModalOpen: Boolean(editingTrack || zoomedKnob)
+  };
+
+  // Studio keyboard shortcuts: Space (Play/Pause), Left/Right (Prev/Next), Up/Down (Volume)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (shortcutActionsRef.current.isModalOpen) return;
+
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        if (
+          target instanceof HTMLTextAreaElement ||
+          target instanceof HTMLSelectElement ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+        if (target instanceof HTMLInputElement) {
+          if (target.type !== 'range') return;
+          if (
+            e.key === 'ArrowLeft' ||
+            e.key === 'ArrowRight' ||
+            e.key === 'ArrowUp' ||
+            e.key === 'ArrowDown'
+          ) {
+            return;
+          }
+        }
+      }
+
+      if (e.code === 'Space' || e.key === ' ') {
+        e.preventDefault();
+        if (!e.repeat) {
+          void shortcutActionsRef.current.togglePlay();
+        }
+        return;
+      }
+
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (!e.repeat) {
+          shortcutActionsRef.current.handleNext();
+        }
+        return;
+      }
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (!e.repeat) {
+          shortcutActionsRef.current.handlePrev();
+        }
+        return;
+      }
+
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const nextVol = Math.min(100, volumeRef.current + 5);
+        volumeRef.current = nextVol;
+        shortcutActionsRef.current.handleVolumeChange(nextVol);
+        return;
+      }
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const nextVol = Math.max(0, volumeRef.current - 5);
+        volumeRef.current = nextVol;
+        shortcutActionsRef.current.handleVolumeChange(nextVol);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const toggleFavorite = (trackId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -778,6 +1214,10 @@ export default function App() {
         <EqualizerPanel
           dspEnabled={dspEnabled}
           bassBoost={bassBoost}
+          autoGainEnabled={autoGainEnabled}
+          autoGainDb={autoGainDb}
+          crossfadeDuration={crossfadeDuration}
+          visualizerTheme={visualizerTheme}
           smartAiEnabled={smartAiEnabled}
           isProfilingAi={isProfilingAi}
           aiStatus={aiStatus}
@@ -789,13 +1229,24 @@ export default function App() {
           band16kHz={band16kHz}
           onToggleDsp={setDspEnabled}
           onToggleBassBoost={setBassBoost}
+          onToggleAutoGain={setAutoGainEnabled}
+          onChangeCrossfade={(secs) => {
+            setCrossfadeDuration(secs);
+            if (secs === 0) resetCrossfadeUnity();
+          }}
+          onChangeVisualizerTheme={(theme) => {
+            setVisualizerTheme(theme);
+            if (typeof window !== 'undefined' && window.localStorage) {
+              window.localStorage.setItem('dsp_visualizer_theme_v1', theme);
+            }
+          }}
           onToggleSmartAi={() => {
             const next = !smartAiEnabled;
             setSmartAiEnabled(next);
             if (next) void triggerAiProfiling(currentTrack);
             else setAiStatus(null);
           }}
-          onRunAiProfile={() => void triggerAiProfiling(currentTrack)}
+          onRunAiProfile={() => void triggerAiProfiling(currentTrack, true)}
           onChangeControlStyle={setEqControlStyle}
           onChangeBand={handleBandChange}
           onApplyPreset={applyPreset}
@@ -830,7 +1281,16 @@ export default function App() {
             shouldPlayOnLoadRef.current = false;
             audioRef.current
               .play()
-              .then(() => setIsPlaying(true))
+              .then(() => {
+                if (pendingFadeInRef.current > 0) {
+                  const fadeIn = pendingFadeInRef.current;
+                  pendingFadeInRef.current = 0;
+                  triggerCrossfadeIn(fadeIn);
+                } else {
+                  resetCrossfadeUnity();
+                }
+                setIsPlaying(true);
+              })
               .catch(() => setIsPlaying(false));
           }
         }}
@@ -940,6 +1400,7 @@ export default function App() {
                   shuffle={shuffle}
                   dspEnabled={dspEnabled}
                   bassBoost={bassBoost}
+                  visualizerTheme={visualizerTheme}
                   analyserRef={analyserRef}
                   onTogglePlay={togglePlay}
                   onPrev={handlePrev}
@@ -1025,6 +1486,7 @@ export default function App() {
                     shuffle={shuffle}
                     dspEnabled={dspEnabled}
                     bassBoost={bassBoost}
+                    visualizerTheme={visualizerTheme}
                     analyserRef={analyserRef}
                     showCollapseButton={true}
                     onTogglePlay={togglePlay}
@@ -1108,6 +1570,8 @@ export default function App() {
         isPlaying={isPlaying}
         dspEnabled={dspEnabled}
         bassBoost={bassBoost}
+        autoGainEnabled={autoGainEnabled}
+        autoGainDb={autoGainDb}
         sampleRateSetting={sampleRate}
       />
 

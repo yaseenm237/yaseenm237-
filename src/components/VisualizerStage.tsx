@@ -1,6 +1,6 @@
 import React, { memo, useState } from 'react';
 import { ChevronLeft, ChevronRight, Disc, LayoutGrid, Upload } from 'lucide-react';
-import { VisualizerStyle } from '../types/audio';
+import { VisualizerStyle, VisualizerTheme } from '../types/audio';
 import { VISUALIZER_OPTIONS } from '../data/tracks';
 import { VisualizerCanvas } from './VisualizerCanvas';
 
@@ -21,6 +21,7 @@ interface VisualizerStageProps {
   isPlaying: boolean;
   dspEnabled: boolean;
   bassBoost: boolean;
+  visualizerTheme?: VisualizerTheme;
   analyserRef: React.RefObject<AnalyserNode | null>;
   onRelinkTrack?: (trackId: string, file: File) => void;
 }
@@ -34,6 +35,7 @@ const VisualizerStageInner: React.FC<VisualizerStageProps> = ({
   isPlaying,
   dspEnabled,
   bassBoost,
+  visualizerTheme = 'cyber_cyan',
   analyserRef,
   onRelinkTrack
 }) => {
@@ -70,6 +72,7 @@ const VisualizerStageInner: React.FC<VisualizerStageProps> = ({
           analyserRef={analyserRef}
           isPlaying={isPlaying}
           visualizerStyle={visualizerStyle}
+          visualizerTheme={visualizerTheme}
           width={440}
           height={144}
           className="w-full h-full"
@@ -84,7 +87,15 @@ const VisualizerStageInner: React.FC<VisualizerStageProps> = ({
               }`}
               style={{ animationDuration: '6s' }}
             >
-              <Disc className="w-5 h-5 text-cyan-400" />
+              <Disc
+                className={`w-5 h-5 ${
+                  visualizerTheme === 'sunset_pink'
+                    ? 'text-pink-400'
+                    : visualizerTheme === 'monochrome_white'
+                    ? 'text-slate-100'
+                    : 'text-cyan-400'
+                }`}
+              />
             </div>
           </div>
         )}

@@ -32,6 +32,46 @@ const ai = process.env.GEMINI_API_KEY
     })
   : null;
 
+const PROFILE_MODEL = 'gemini-3.1-flash-lite';
+const MAX_CACHE_ENTRIES = 500;
+const profileCache = new Map<
+  string,
+  { detectedGenre: string; preset: EqPreset; reason: string }
+>();
+let quotaCooldownUntilMs = 0;
+
+function makeCacheKey(tags: ProfilerRequestBody): string {
+  return [
+    tags.title || '',
+    tags.artist || '',
+    tags.album || '',
+    tags.id3Genre || '',
+    tags.genre || '',
+    tags.bpm || '',
+    tags.year || ''
+  ]
+    .map((v) => v.trim().toLowerCase())
+    .join('|');
+}
+
+function isQuotaError(err: unknown): { isQuota: boolean; retryMs: number } {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  const status =
+    typeof err === 'object' && err !== null && 'status' in err
+      ? (err as { status?: number }).status
+      : undefined;
+  const isQuota =
+    status === 429 ||
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.toLowerCase().includes('quota');
+  if (!isQuota) return { isQuota: false, retryMs: 0 };
+
+  const retryMatch = msg.match(/retryDelay["']?\s*:\s*["']?(\d+)s/i);
+  const retrySecs = retryMatch ? Math.min(3600, Math.max(60, Number(retryMatch[1]))) : 900;
+  return { isQuota: true, retryMs: retrySecs * 1000 };
+}
+
 function fallbackRuleMatch(tags: ProfilerRequestBody): {
   preset: EqPreset;
   detectedGenre: string;
@@ -90,8 +130,18 @@ async function startServer() {
 
   app.post('/api/smart-genre-profiler', async (req, res) => {
     const body = (req.body || {}) as ProfilerRequestBody;
+    const cacheKey = makeCacheKey(body);
 
-    if (!ai) {
+    const cached = profileCache.get(cacheKey);
+    if (cached) {
+      return res.json({
+        ...cached,
+        source: 'gemini-ai',
+        cached: true
+      });
+    }
+
+    if (!ai || Date.now() < quotaCooldownUntilMs) {
       return res.json({
         ...fallbackRuleMatch(body),
         source: 'id3-heuristic'
@@ -112,7 +162,7 @@ async function startServer() {
         .join('\n');
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: PROFILE_MODEL,
         contents: `Analyze these audio track ID3 metadata tags and select the single best matching EQ preset from the allowed list:
 Available EQ presets:
 - "cyber": Synthwave, Cyberpunk, Retrowave, Outrun, Darkwave, Vaporwave, 80s Synth
@@ -125,7 +175,7 @@ Available EQ presets:
 Track ID3 Tags:
 ${tagSummary}`,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
           systemInstruction:
             'You are an expert audio mastering engineer. Classify the track genre from its ID3 tags and map it strictly to one of the six EQ presets: flat, cyber, rock, electronic, vocal, acoustic.',
           responseMimeType: 'application/json',
@@ -161,19 +211,41 @@ ${tagSummary}`,
         ? (parsed.preset as EqPreset)
         : fallbackRuleMatch(body).preset;
 
-      return res.json({
+      const result = {
         detectedGenre: parsed.detectedGenre || body.id3Genre || body.genre || 'Analyzed',
         preset: normalizedPreset,
-        reason: parsed.reason || `AI mapped track ID3 profile to ${normalizedPreset} EQ`,
+        reason: parsed.reason || `AI mapped track ID3 profile to ${normalizedPreset} EQ`
+      };
+
+      if (profileCache.size >= MAX_CACHE_ENTRIES) {
+        const oldestKey = profileCache.keys().next().value;
+        if (oldestKey !== undefined) profileCache.delete(oldestKey);
+      }
+      profileCache.set(cacheKey, result);
+
+      return res.json({
+        ...result,
         source: 'gemini-ai'
       });
     } catch (err) {
-      console.error('Smart Genre Profiler Gemini error:', err);
+      const { isQuota, retryMs } = isQuotaError(err);
+      if (isQuota) {
+        quotaCooldownUntilMs = Date.now() + retryMs;
+        console.warn(
+          `Smart Genre Profiler quota limit reached for ${PROFILE_MODEL}; using ID3 heuristic fallback for ${Math.round(
+            retryMs / 1000
+          )}s.`
+        );
+      } else {
+        console.warn(
+          'Smart Genre Profiler fallback applied:',
+          err instanceof Error ? err.message : String(err)
+        );
+      }
       const fallback = fallbackRuleMatch(body);
       return res.status(200).json({
         ...fallback,
-        source: 'id3-heuristic',
-        warning: err instanceof Error ? err.message : 'AI profiler fallback applied'
+        source: 'id3-heuristic'
       });
     }
   });

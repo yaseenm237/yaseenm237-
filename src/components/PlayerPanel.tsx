@@ -13,7 +13,7 @@ import {
   VolumeX,
   ZoomIn
 } from 'lucide-react';
-import { Track, ZoomedKnobTarget } from '../types/audio';
+import { Track, VisualizerTheme, ZoomedKnobTarget } from '../types/audio';
 import { formatTime } from '../data/tracks';
 import { VisualizerStage } from './VisualizerStage';
 
@@ -30,6 +30,7 @@ interface PlayerPanelProps {
   shuffle: boolean;
   dspEnabled: boolean;
   bassBoost: boolean;
+  visualizerTheme?: VisualizerTheme;
   analyserRef: React.RefObject<AnalyserNode | null>;
   showCollapseButton?: boolean;
   onTogglePlay: () => void;
@@ -59,6 +60,7 @@ const PlayerPanelInner: React.FC<PlayerPanelProps> = ({
   shuffle,
   dspEnabled,
   bassBoost,
+  visualizerTheme = 'cyber_cyan',
   analyserRef,
   showCollapseButton = false,
   onTogglePlay,
@@ -153,6 +155,7 @@ const PlayerPanelInner: React.FC<PlayerPanelProps> = ({
         isPlaying={isPlaying}
         dspEnabled={dspEnabled}
         bassBoost={bassBoost}
+        visualizerTheme={visualizerTheme}
         analyserRef={analyserRef}
         onRelinkTrack={onRelinkTrack}
       />

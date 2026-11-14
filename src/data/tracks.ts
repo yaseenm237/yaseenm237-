@@ -1,4 +1,4 @@
-import { EqPreset, EqSettings, Track, VisualizerStyle } from '../types/audio';
+import { EqPreset, EqSettings, Track, VisualizerStyle, VisualizerTheme } from '../types/audio';
 
 export const DEFAULT_TRACKS: Track[] = [
   {
@@ -114,6 +114,36 @@ export const VISUALIZER_OPTIONS: Array<{ id: VisualizerStyle; label: string; des
   { id: 'particles', label: 'Particles', desc: 'Beat-reactive 3D depth starfield' }
 ];
 
+export const VISUALIZER_THEMES: Array<{
+  id: VisualizerTheme;
+  label: string;
+  shortLabel: string;
+  swatchClass: string;
+  activeClass: string;
+}> = [
+  {
+    id: 'cyber_cyan',
+    label: 'Cyber Cyan',
+    shortLabel: 'Cyan',
+    swatchClass: 'bg-cyan-400',
+    activeClass: 'bg-cyan-500/20 border-cyan-400/60 text-cyan-300 font-semibold'
+  },
+  {
+    id: 'sunset_pink',
+    label: 'Sunset Pink',
+    shortLabel: 'Pink',
+    swatchClass: 'bg-pink-400',
+    activeClass: 'bg-pink-500/20 border-pink-400/60 text-pink-300 font-semibold'
+  },
+  {
+    id: 'monochrome_white',
+    label: 'Monochrome White',
+    shortLabel: 'Mono',
+    swatchClass: 'bg-slate-100',
+    activeClass: 'bg-white/15 border-white/50 text-white font-semibold'
+  }
+];
+
 export const RUST_BLUEPRINT_SNIPPET = `// src/state.rs — Rust + Iced 0.13 State & Messages (Desktop 950x650 / Mobile 360x600)
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -173,8 +203,11 @@ pub enum Message {
     ToggleFavorite(String),
     SelectVisualizer(VisualizerMode),
     StepVisualizer(i8),
+    SelectVisualizerTheme(VisualizerTheme),
     ToggleDSP(bool),
     ToggleBassBoost(bool),
+    ToggleAutoGain(bool),
+    CrossfadeChanged(f32),
     BandChanged(FrequencyBand, f32),
     ResetEQ,
 }`;

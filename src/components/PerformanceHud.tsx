@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Cpu, Gauge } from 'lucide-react';
+import { Activity, Cpu, Gauge, ShieldCheck } from 'lucide-react';
 
 interface PerformanceHudProps {
   audioCtxRef: React.RefObject<AudioContext | null>;
@@ -7,6 +7,8 @@ interface PerformanceHudProps {
   isPlaying: boolean;
   dspEnabled: boolean;
   bassBoost: boolean;
+  autoGainEnabled: boolean;
+  autoGainDb: number;
   sampleRateSetting: '48kHz' | '96kHz';
 }
 
@@ -23,6 +25,8 @@ export const PerformanceHud: React.FC<PerformanceHudProps> = ({
   isPlaying,
   dspEnabled,
   bassBoost,
+  autoGainEnabled,
+  autoGainDb,
   sampleRateSetting
 }) => {
   const [metrics, setMetrics] = useState<HudMetrics>(() => ({
@@ -130,6 +134,34 @@ export const PerformanceHud: React.FC<PerformanceHudProps> = ({
             <span>Graph:</span>
             <span className="text-slate-200 font-medium">
               {dspEnabled ? `${activeNodes} Biquad Nodes` : 'Bypass'}
+            </span>
+          </div>
+
+          <span className="text-slate-700 hidden lg:inline">|</span>
+
+          <div className="hidden lg:flex items-center gap-1.5 text-slate-400">
+            <ShieldCheck
+              className={`w-3.5 h-3.5 ${
+                !autoGainEnabled
+                  ? 'text-slate-500'
+                  : autoGainDb <= -0.5
+                  ? 'text-amber-400'
+                  : 'text-emerald-400'
+              }`}
+            />
+            <span>Auto-Gain:</span>
+            <span
+              className={`font-semibold ${
+                !autoGainEnabled
+                  ? 'text-slate-500'
+                  : autoGainDb <= -0.5
+                  ? 'text-amber-300'
+                  : 'text-emerald-300'
+              }`}
+            >
+              {autoGainEnabled
+                ? `${autoGainDb > 0.05 ? '+' : ''}${autoGainDb.toFixed(1)} dB`
+                : 'OFF'}
             </span>
           </div>
         </div>
